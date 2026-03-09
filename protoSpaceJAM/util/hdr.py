@@ -3515,6 +3515,8 @@ def _get_position_type(chr, ID, pos, loc2posType):
     input: mostly self-explanatory, loc2posType is a dictionary that translates location into types (e.g. exon/intron junctions etc)
     return a list of types for the input position/ID combination
     """
+    if chr not in loc2posType:
+        return []
     chr_dict = loc2posType[chr]
     if not ID in chr_dict.keys():
         return []

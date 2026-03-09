@@ -1,4 +1,5 @@
 from Bio.Seq import Seq
+import os
 import os.path
 import pandas as pd
 from Bio.Seq import reverse_complement
@@ -7,9 +8,114 @@ import sys
 import math
 import pickle
 import logging
+import time
+import json
+import subprocess
+import tempfile
+import re
+import csv
+from io import StringIO
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from protoSpaceJAM.util.hdr import HDR_flank #uncomment this for pip installation
 # from util.hdr import HDR_flank
+
+GUIDE_COLUMNS = [
+    "seq",
+    "pam",
+    "start",
+    "end",
+    "strand",
+    "guideMITScore",
+    "guideCfdScore",
+    "guideCfdScorev2",
+    "guideCfdScorev3",
+    "Eff_scores",
+]
+
+GENOME_TO_ENSEMBL = {
+    "GRCh38": ("homo_sapiens", "GRCh38"),
+    "GRCm39": ("mus_musculus", "GRCm39"),
+    "GRCz11": ("danio_rerio", "GRCz11"),
+    "mRatBN7.2": ("rattus_norvegicus", "mRatBN7.2"),
+}
+
+GENOME_TO_CHOPCHOP = {
+    "GRCh38": "hg38",
+    "GRCm39": "mm39",
+    "GRCz11": "danRer11",
+    "mRatBN7.2": "mRatBN7.2",
+}
+
+
+def _dump_chopchop_debug(
+    chopchop_config,
+    source,
+    chrom,
+    pos,
+    window_start,
+    window_end,
+    target_seq,
+    payload=None,
+):
+    if chopchop_config is None or not chopchop_config.get("debug_dump", False):
+        return
+    outdir = chopchop_config.get("debug_outdir", ".")
+    debug_dir = os.path.join(outdir, "chopchop_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    stem = f"{source}_{str(chrom).replace(':', '_')}_{int(pos)}_{int(window_start)}_{int(window_end)}"
+
+    fasta_path = os.path.join(debug_dir, f"{stem}.fa")
+    with open(fasta_path, "w") as fh:
+        fh.write(f">{chrom}:{window_start}-{window_end}\n{target_seq}\n")
+
+    meta = {
+        "source": source,
+        "chrom": str(chrom),
+        "pos": int(pos),
+        "window_start": int(window_start),
+        "window_end": int(window_end),
+        "sequence_length": len(target_seq),
+    }
+    if payload is not None:
+        meta["payload"] = payload
+    with open(os.path.join(debug_dir, f"{stem}.json"), "w") as jh:
+        json.dump(meta, jh, indent=2)
+
+    # Also keep a flat CSV log for quick cross-checking against CHOPCHOP web runs.
+    csv_path = os.path.join(debug_dir, "chopchop_debug_windows.csv")
+    write_header = not os.path.isfile(csv_path)
+    with open(csv_path, "a", newline="") as ch:
+        writer = csv.writer(ch)
+        if write_header:
+            writer.writerow(
+                [
+                    "source",
+                    "chrom",
+                    "pos",
+                    "window_start",
+                    "window_end",
+                    "sequence_length",
+                    "sequence_window",
+                    "fasta_path",
+                    "json_path",
+                ]
+            )
+        writer.writerow(
+            [
+                source,
+                str(chrom),
+                int(pos),
+                int(window_start),
+                int(window_end),
+                len(target_seq),
+                target_seq,
+                fasta_path,
+                os.path.join(debug_dir, f"{stem}.json"),
+            ]
+        )
 
 class MyParser(argparse.ArgumentParser):
     def error(self, message):
@@ -388,6 +494,8 @@ def get_gRNAs_target_coordinate(
     spec_score_flavor,
     reg_penalty,
     alphas,
+    guide_source="precomputed",
+    chopchop_config=None,
     dist=50,
 ):
     """
@@ -419,22 +527,36 @@ def get_gRNAs_target_coordinate(
         loc2file_index=loc2file_index,
         genome_ver=genome_ver,
         pam=pam,
+        guide_source=guide_source,
+        chopchop_config=chopchop_config,
     )
-    # rank gRNAs
-    ranked_df_gRNAs_target_pos = rank_gRNAs_for_tagging(
-        loc=target_pos,
-        gRNA_df=df_gRNAs_target_pos,
-        loc2posType=loc2posType,
-        ENST_ID=ENST_ID,
-        ENST_strand=ENST_strand,
-        type="start",
-        spec_score_flavor=spec_score_flavor,
-        reg_penalty=reg_penalty,
-        alphas=alphas,
+    keep_chopchop_order = (
+        str(guide_source).lower() == "chopchop"
+        and not (chopchop_config or {}).get("psj_rank_chopchop", False)
     )
-    ranked_df_gRNAs_ATG = ranked_df_gRNAs_target_pos.sort_values(
-        "final_weight", ascending=False
-    )  # sort descending on final weight
+    if keep_chopchop_order:
+        ranked_df_gRNAs_ATG = _decorate_guides_for_hdr_without_reranking(
+            loc=target_pos,
+            gRNA_df=df_gRNAs_target_pos,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="start",
+        )
+    else:
+        ranked_df_gRNAs_target_pos = rank_gRNAs_for_tagging(
+            loc=target_pos,
+            gRNA_df=df_gRNAs_target_pos,
+            loc2posType=loc2posType,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="start",
+            spec_score_flavor=spec_score_flavor,
+            reg_penalty=reg_penalty,
+            alphas=alphas,
+        )
+        ranked_df_gRNAs_ATG = ranked_df_gRNAs_target_pos.sort_values(
+            "final_weight", ascending=False
+        )  # sort descending on final weight
 
     return ranked_df_gRNAs_ATG
 
@@ -450,6 +572,8 @@ def get_gRNAs(
     spec_score_flavor,
     reg_penalty,
     alphas,
+    guide_source="precomputed",
+    chopchop_config=None,
     dist=50,
 ):
     """
@@ -482,22 +606,36 @@ def get_gRNAs(
         loc2file_index=loc2file_index,
         genome_ver=genome_ver,
         pam=pam,
+        guide_source=guide_source,
+        chopchop_config=chopchop_config,
     )
-    # rank gRNAs
-    ranked_df_gRNAs_ATG = rank_gRNAs_for_tagging(
-        loc=end_of_ATG_loc,
-        gRNA_df=df_gRNAs_ATG,
-        loc2posType=loc2posType,
-        ENST_ID=ENST_ID,
-        ENST_strand=ENST_strand,
-        type="start",
-        spec_score_flavor=spec_score_flavor,
-        reg_penalty=reg_penalty,
-        alphas=alphas
+    keep_chopchop_order = (
+        str(guide_source).lower() == "chopchop"
+        and not (chopchop_config or {}).get("psj_rank_chopchop", False)
     )
-    ranked_df_gRNAs_ATG = ranked_df_gRNAs_ATG.sort_values(
-        "final_weight", ascending=False
-    )  # sort descending on final weight
+    if keep_chopchop_order:
+        ranked_df_gRNAs_ATG = _decorate_guides_for_hdr_without_reranking(
+            loc=end_of_ATG_loc,
+            gRNA_df=df_gRNAs_ATG,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="start",
+        )
+    else:
+        ranked_df_gRNAs_ATG = rank_gRNAs_for_tagging(
+            loc=end_of_ATG_loc,
+            gRNA_df=df_gRNAs_ATG,
+            loc2posType=loc2posType,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="start",
+            spec_score_flavor=spec_score_flavor,
+            reg_penalty=reg_penalty,
+            alphas=alphas
+        )
+        ranked_df_gRNAs_ATG = ranked_df_gRNAs_ATG.sort_values(
+            "final_weight", ascending=False
+        )  # sort descending on final weight
 
     ##################################
     # get gRNAs around the stop  codon#
@@ -513,22 +651,32 @@ def get_gRNAs(
         loc2file_index=loc2file_index,
         genome_ver=genome_ver,
         pam=pam,
+        guide_source=guide_source,
+        chopchop_config=chopchop_config,
     )
-    # rank gRNAs
-    ranked_df_gRNAs_stop = rank_gRNAs_for_tagging(
-        loc=start_of_stop_loc,
-        gRNA_df=df_gRNAs_stop,
-        loc2posType=loc2posType,
-        ENST_ID=ENST_ID,
-        ENST_strand=ENST_strand,
-        type="stop",
-        spec_score_flavor=spec_score_flavor,
-        reg_penalty=reg_penalty,
-        alphas=alphas
-    )
-    ranked_df_gRNAs_stop = ranked_df_gRNAs_stop.sort_values(
-        "final_weight", ascending=False
-    )  # sort descending on final weight
+    if keep_chopchop_order:
+        ranked_df_gRNAs_stop = _decorate_guides_for_hdr_without_reranking(
+            loc=start_of_stop_loc,
+            gRNA_df=df_gRNAs_stop,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="stop",
+        )
+    else:
+        ranked_df_gRNAs_stop = rank_gRNAs_for_tagging(
+            loc=start_of_stop_loc,
+            gRNA_df=df_gRNAs_stop,
+            loc2posType=loc2posType,
+            ENST_ID=ENST_ID,
+            ENST_strand=ENST_strand,
+            type="stop",
+            spec_score_flavor=spec_score_flavor,
+            reg_penalty=reg_penalty,
+            alphas=alphas
+        )
+        ranked_df_gRNAs_stop = ranked_df_gRNAs_stop.sort_values(
+            "final_weight", ascending=False
+        )  # sort descending on final weight
 
     return [ranked_df_gRNAs_ATG, ranked_df_gRNAs_stop]
 
@@ -629,6 +777,42 @@ def rank_gRNAs_for_tagging(
     # rank gRNAs based on the score
     gRNA_df["final_pct_rank"] = gRNA_df["final_weight"].rank(pct=True)
 
+    return gRNA_df
+
+
+def _decorate_guides_for_hdr_without_reranking(loc, gRNA_df, ENST_ID, ENST_strand, type):
+    """
+    Keep incoming guide order (e.g. CHOPCHOP rank order), but add the
+    columns required by downstream HDR generation and reporting.
+    """
+    if gRNA_df is None or gRNA_df.empty:
+        return gRNA_df
+
+    insPos = loc[1]
+    Chr = loc[0]
+    gRNA_df = gRNA_df.copy()
+
+    cut2insDist_list = []
+    for _, row in gRNA_df.iterrows():
+        cutPos = get_cut_pos(row["start"], row["strand"])
+        cut2insDist = cutPos - insPos
+        if type == "start" and ENST_strand == -1:
+            cut2insDist += 1
+        if type == "stop" and ENST_strand == 1:
+            cut2insDist += 1
+        cut2insDist_list.append(cut2insDist)
+
+    gRNA_df["chr"] = Chr
+    gRNA_df["ID"] = ENST_ID
+    gRNA_df["Insert_pos"] = insPos
+    gRNA_df["Cut2Ins_dist"] = cut2insDist_list
+    # Neutral placeholders so downstream code remains compatible.
+    gRNA_df["spec_weight"] = 1.0
+    gRNA_df["dist_weight"] = 1.0
+    gRNA_df["pos_weight"] = 1.0
+    # Preserve current row order explicitly.
+    gRNA_df["final_weight"] = list(range(len(gRNA_df), 0, -1))
+    gRNA_df["final_pct_rank"] = gRNA_df["final_weight"].rank(pct=True)
     return gRNA_df
 
 
@@ -737,6 +921,8 @@ def _get_position_type(chr, ID, pos, loc2posType):
     ['cds', '3N4bp_down_of_intron_exon_junction']
     """
     # print(f"{type(chr)} {ID} {type(pos)}")
+    if chr not in loc2posType:
+        return []
     chr_dict = loc2posType[chr]
     if not ID in chr_dict.keys():
         return []
@@ -901,61 +1087,597 @@ def get_start_stop_loc(ENST_ID, ENST_info):
     return [ATG_loc, stop_loc]
 
 
-def get_gRNAs_near_loc(loc, dist, loc2file_index, genome_ver, pam):
+def _empty_guides_df():
+    return pd.DataFrame(columns=GUIDE_COLUMNS)
+
+
+def _canonize_chromosome(chr_name):
+    chr_name = str(chr_name)
+    if chr_name.lower().startswith("chr"):
+        return chr_name[3:]
+    return chr_name
+
+
+def _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver):
+    species, _assembly = GENOME_TO_ENSEMBL.get(genome_ver, ("homo_sapiens", "GRCh38"))
+    chrom = _canonize_chromosome(chrom)
+    strand_num = 1 if str(strand) in ("1", "+", "plus") else -1
+    region = f"{chrom}:{int(start)}..{int(end)}:{strand_num}"
+    return f"https://rest.ensembl.org/sequence/region/{species}/{region}?content-type=application/json"
+
+
+def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=30):
+    url = _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver)
+    req = Request(url, headers={"Accept": "application/json", "Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Unable to fetch sequence from Ensembl ({url}): {exc}") from exc
+    if "seq" not in data:
+        raise RuntimeError(f"Ensembl sequence response missing 'seq' for {chrom}:{start}-{end}")
+    return data["seq"].upper()
+
+
+def _best_numeric_series(df, candidates, default_value):
+    for name in candidates:
+        if name in df.columns:
+            out = pd.to_numeric(df[name], errors="coerce")
+            if out.notna().any():
+                return out
+    return pd.Series([default_value] * len(df), index=df.index, dtype=float)
+
+
+def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
+    if df_raw is None or df_raw.empty:
+        return _empty_guides_df()
+
+    cols = {c.lower().strip(): c for c in df_raw.columns}
+    seq_col = None
+    for key in ["seq", "sequence", "guide", "target", "targetsequence", "target sequence", "sgrna"]:
+        if key.lower() in cols:
+            seq_col = cols[key.lower()]
+            break
+    if seq_col is None:
+        raise RuntimeError("CHOPCHOP output is missing a guide sequence column")
+
+    start_col = None
+    end_col = None
+    strand_col = None
+    pam_col = None
+    for key in ["start", "chromstart", "genomicstart", "from"]:
+        if key.lower() in cols:
+            start_col = cols[key.lower()]
+            break
+    for key in ["end", "chromend", "genomicend", "to"]:
+        if key.lower() in cols:
+            end_col = cols[key.lower()]
+            break
+    for key in ["strand", "orientation"]:
+        if key.lower() in cols:
+            strand_col = cols[key.lower()]
+            break
+    for key in ["pam", "pamseq", "pam_sequence"]:
+        if key.lower() in cols:
+            pam_col = cols[key.lower()]
+            break
+
+    genomic_loc_col = None
+    for key in ["genomic location", "genomic_location", "location", "position"]:
+        if key.lower() in cols:
+            genomic_loc_col = cols[key.lower()]
+            break
+
+    if (start_col is None or end_col is None) and genomic_loc_col is None:
+        raise RuntimeError("CHOPCHOP output must include start/end or genomic location columns")
+    if strand_col is None:
+        raise RuntimeError("CHOPCHOP output must include strand column")
+
+    if start_col is not None and end_col is not None:
+        start = pd.to_numeric(df_raw[start_col], errors="coerce")
+        end = pd.to_numeric(df_raw[end_col], errors="coerce")
+    else:
+        # results.tsv exposes one genomic position; approximate start/end from that anchor.
+        anchor = (
+            df_raw[genomic_loc_col]
+            .astype(str)
+            .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")["pos"]
+        )
+        anchor = pd.to_numeric(anchor, errors="coerce")
+        start = anchor.copy()
+        end = anchor.copy()
+
+    strand = df_raw[strand_col].astype(str).str.strip().replace({"1": "+", "-1": "-"})
+
+    full_seq = df_raw[seq_col].astype(str).str.upper().str.replace(r"[^ACGTN]", "", regex=True)
+
+    # CHOPCHOP outputs may be local window coordinates; convert when needed.
+    max_coord = pd.concat([start, end], axis=1).max(axis=1)
+    if max_coord.max(skipna=True) <= 5000:
+        start = start + int(window_start) - 1
+        end = end + int(window_start) - 1
+
+    if start_col is None or end_col is None:
+        # Approximate 20nt protospacer span when only one genomic location is provided.
+        seq_len = full_seq.str.len().where(full_seq.str.len() > 0, 20)
+        plus_mask = strand == "+"
+        minus_mask = strand == "-"
+        end = end.where(~plus_mask, start + seq_len - 1)
+        end = end.where(~minus_mask, start - seq_len + 1)
+
+    df = pd.DataFrame(index=df_raw.index)
+    seq_guess = full_seq.where(full_seq.str.len() <= 20, full_seq.str.slice(0, 20))
+    pam_guess = full_seq.where(full_seq.str.len() < 23, full_seq.str.slice(-3))
+    df["seq"] = seq_guess
+    df["pam"] = df_raw[pam_col].astype(str).str.upper() if pam_col else pam_guess.fillna(str(pam).upper())
+    df["start"] = start.round().astype("Int64")
+    df["end"] = end.round().astype("Int64")
+    df["strand"] = strand
+
+    # Match historical column names used by downstream ranking.
+    mit_scores = _best_numeric_series(
+        df_raw,
+        ["guideMITScore", "mitscore", "mit_score", "specificity", "offtargetscore", "score"],
+        50.0,
+    )
+    eff_scores = _best_numeric_series(
+        df_raw,
+        ["eff_score", "efficiency", "doench", "eff_scores", "score"],
+        0.0,
+    )
+    df["guideMITScore"] = mit_scores.clip(lower=0, upper=100)
+    df["guideCfdScore"] = mit_scores.clip(lower=0, upper=100)
+    df["guideCfdScorev2"] = mit_scores.clip(lower=0, upper=100)
+    df["guideCfdScorev3"] = mit_scores.clip(lower=0, upper=100)
+    df["Eff_scores"] = eff_scores
+
+    # Keep legacy convention: for '-' guides, start > end.
+    neg = df["strand"] == "-"
+    swap_idx = neg & (df["start"] < df["end"])
+    start_swap = df.loc[swap_idx, "start"].copy()
+    df.loc[swap_idx, "start"] = df.loc[swap_idx, "end"]
+    df.loc[swap_idx, "end"] = start_swap
+
+    pos = df["strand"] == "+"
+    swap_idx = pos & (df["start"] > df["end"])
+    start_swap = df.loc[swap_idx, "start"].copy()
+    df.loc[swap_idx, "start"] = df.loc[swap_idx, "end"]
+    df.loc[swap_idx, "end"] = start_swap
+
+    df = df.dropna(subset=["start", "end"])
+    df["start"] = df["start"].astype(int)
+    df["end"] = df["end"].astype(int)
+    df["strand"] = df["strand"].where(df["strand"].isin(["+", "-"]), "+")
+    return df[GUIDE_COLUMNS]
+
+
+def convert_chopchop_raw_to_psj(df_raw, pam, window_start=1, desired_insert_pos=None, default_chr=None):
+    """
+    Convert raw CHOPCHOP results.tsv table to protoSpaceJAM guide schema.
+    Keeps CHOPCHOP order.
+    """
+    df = _standardize_chopchop_df(
+        df_raw=df_raw,
+        chr_name=default_chr or "",
+        pam=pam,
+        window_start=window_start,
+    )
+    # Fill chromosome from CHOPCHOP raw genomic location when available.
+    cols = {c.lower().strip(): c for c in df_raw.columns}
+    genomic_col = None
+    for key in ["genomic location", "genomic_location", "location", "position"]:
+        if key.lower() in cols:
+            genomic_col = cols[key.lower()]
+            break
+    if genomic_col is not None:
+        extracted = (
+            df_raw[genomic_col]
+            .astype(str)
+            .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")
+        )
+        if "chr" in extracted.columns:
+            df["chr"] = extracted["chr"].fillna(default_chr if default_chr is not None else "")
+
+    if desired_insert_pos is not None:
+        df["Insert_pos"] = int(desired_insert_pos)
+
+    return df
+
+
+def _run_chopchop_from_template(loc, dist, genome_ver, pam, chopchop_config):
+    if chopchop_config is None:
+        chopchop_config = {}
+    cmd_template = chopchop_config.get("cmd_template", "")
+    if cmd_template == "":
+        raise RuntimeError(
+            "CHOPCHOP guide source requested, but no command template was provided. "
+            "Set --chopchop_cmd_template."
+        )
+
+    chrom, pos, _strand = loc
+    flank = int(chopchop_config.get("window_padding", 80))
+    window_start = max(1, int(pos) - int(dist) - flank)
+    window_end = int(pos) + int(dist) + flank
+    target_seq = fetch_sequence_from_ensembl(
+        chrom=chrom,
+        start=window_start,
+        end=window_end,
+        strand=1,
+        genome_ver=genome_ver,
+        timeout=int(chopchop_config.get("ensembl_timeout", 30)),
+    )
+    _dump_chopchop_debug(
+        chopchop_config=chopchop_config,
+        source="template",
+        chrom=chrom,
+        pos=pos,
+        window_start=window_start,
+        window_end=window_end,
+        target_seq=target_seq,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="protospacejam_chopchop_") as temp_dir:
+        fasta_path = os.path.join(temp_dir, "target.fa")
+        output_file = os.path.join(temp_dir, "chopchop_output.tsv")
+        with open(fasta_path, "w") as fasta_handle:
+            fasta_handle.write(f">{chrom}_{pos}\n{target_seq}\n")
+
+        format_args = {
+            "fasta": fasta_path,
+            "output_file": output_file,
+            "output_dir": temp_dir,
+            "pam": str(pam).upper(),
+            "genome": genome_ver,
+            "chrom": chrom,
+            "pos": int(pos),
+            "window_start": int(window_start),
+            "window_end": int(window_end),
+        }
+        cmd = cmd_template.format(**format_args)
+        completed = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "CHOPCHOP command failed. "
+                f"exit={completed.returncode}; stderr={completed.stderr.strip()}"
+            )
+        if not os.path.isfile(output_file):
+            raise RuntimeError(
+                "CHOPCHOP command completed but did not produce output file. "
+                f"Expected: {output_file}"
+            )
+
+        df_raw = pd.read_csv(output_file, sep=None, engine="python")
+        return _standardize_chopchop_df(
+            df_raw=df_raw,
+            chr_name=chrom,
+            pam=pam,
+            window_start=window_start,
+        )
+
+
+def _extract_job_id_from_text(text):
+    if text is None:
+        return None
+    m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", text, re.IGNORECASE)
+    return m.group(0) if m else None
+
+
+def _default_chopchop_web_payload(target_seq, genome_ver, pam, chopchop_config, gene_input=""):
+    chopchop_genome = GENOME_TO_CHOPCHOP.get(genome_ver, "hg38")
+    window_df = int(chopchop_config.get("window_padding", 80)) * 2 + 100
+    return {
+        "opts": [
+            "-J", "-BED", "-GenBank",
+            "-G", chopchop_genome,
+            "-filterGCmin", "10",
+            "-filterGCmax", "90",
+            "-t", "CODING",
+            "-n", "N",
+            "-R", "4",
+            "-P",
+            "-A", "290",
+            "-DF", str(window_df),
+            "-a", "20",
+            "-T", "1",
+            "-g", "20",
+            "-scoringMethod", "DOENCH_2016",
+            "-f", "NN",
+            "-v", "3",
+            "-repairPredictions", "mESC",
+            "-M", str(pam).upper(),
+            "-BB", "AGGCTAGTCCGT",
+        ],
+        "fastaInput": "" if gene_input else target_seq,
+        "geneInput": gene_input,
+        "isIsoform": False,
+        "forSelect": str(chopchop_config.get("for_select", "knock-out")),
+    }
+
+
+def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
+    if chopchop_config is None:
+        chopchop_config = {}
+    base_url = chopchop_config.get("web_base_url", "https://chopchop.cbu.uib.no").rstrip("/")
+    timeout = int(chopchop_config.get("web_timeout", 180))
+    poll_sec = float(chopchop_config.get("web_poll_interval", 2))
+
+    chrom, pos, _strand = loc
+    gene_input = str(chopchop_config.get("gene_input", "")).strip()
+    flank = int(chopchop_config.get("window_padding", 80))
+    window_start = max(1, int(pos) - int(dist) - flank)
+    window_end = int(pos) + int(dist) + flank
+    target_seq = ""
+    if gene_input == "":
+        target_seq = fetch_sequence_from_ensembl(
+            chrom=chrom,
+            start=window_start,
+            end=window_end,
+            strand=1,
+            genome_ver=genome_ver,
+            timeout=int(chopchop_config.get("ensembl_timeout", 30)),
+        )
+
+    payload_json = chopchop_config.get("web_payload_json", "")
+    if payload_json:
+        payload = json.loads(payload_json)
+        payload["fastaInput"] = target_seq
+        payload["geneInput"] = payload.get("geneInput", "")
+        if "opts" in payload and isinstance(payload["opts"], list):
+            opts = []
+            i = 0
+            while i < len(payload["opts"]):
+                tok = payload["opts"][i]
+                if tok == "-M" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-M", str(pam).upper()])
+                    i += 2
+                    continue
+                if tok == "-G" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-G", GENOME_TO_CHOPCHOP.get(genome_ver, payload["opts"][i + 1])])
+                    i += 2
+                    continue
+                opts.append(tok)
+                i += 1
+            payload["opts"] = opts
+    else:
+        payload = _default_chopchop_web_payload(
+            target_seq=target_seq,
+            genome_ver=genome_ver,
+            pam=pam,
+            chopchop_config=chopchop_config,
+            gene_input=gene_input,
+        )
+    _dump_chopchop_debug(
+        chopchop_config=chopchop_config,
+        source="web",
+        chrom=chrom,
+        pos=pos,
+        window_start=window_start,
+        window_end=window_end,
+        target_seq=target_seq,
+        payload=payload,
+    )
+
+    submit_url = base_url + "/"
+    req = Request(
+        submit_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as response:
+        body = response.read().decode("utf-8", errors="ignore")
+        header_text = str(response.headers)
+        job_id = _extract_job_id_from_text(body) or _extract_job_id_from_text(header_text) or _extract_job_id_from_text(response.geturl())
+
+    if not job_id:
+        raise RuntimeError(
+            "CHOPCHOP web submit succeeded but job id was not found in response. "
+            "Provide --chopchop_web_payload_json copied from your browser payload if needed."
+        )
+
+    results_url = urljoin(base_url + "/", f"results/{job_id}/results.tsv")
+    query_url = urljoin(base_url + "/", f"results/{job_id}/query.json")
+    deadline = pd.Timestamp.utcnow().timestamp() + timeout
+    last_error = None
+    while pd.Timestamp.utcnow().timestamp() < deadline:
+        try:
+            req_results = Request(results_url, headers={"Accept": "*/*"})
+            with urlopen(req_results, timeout=30) as res:
+                txt = res.read().decode("utf-8", errors="ignore")
+            if "Target sequence" in txt or "Rank\t" in txt:
+                df_raw = pd.read_csv(StringIO(txt), sep="\t")
+                try:
+                    req_query = Request(query_url, headers={"Accept": "*/*"})
+                    with urlopen(req_query, timeout=10):
+                        pass
+                except Exception:
+                    pass
+                win_start = window_start if gene_input == "" else 1
+                return _standardize_chopchop_df(
+                    df_raw=df_raw,
+                    chr_name=chrom,
+                    pam=pam,
+                    window_start=win_start,
+                )
+        except Exception as exc:
+            last_error = exc
+        time.sleep(poll_sec)
+
+    raise RuntimeError(
+        f"Timed out waiting for CHOPCHOP web results ({results_url}). Last error: {last_error}"
+    )
+
+
+def get_chopchop_raw_results(loc, dist, genome_ver, pam, chopchop_config):
+    """
+    Submit a CHOPCHOP web job and return the raw results.tsv table
+    with original CHOPCHOP website fields.
+    """
+    if chopchop_config is None:
+        chopchop_config = {}
+    base_url = chopchop_config.get("web_base_url", "https://chopchop.cbu.uib.no").rstrip("/")
+    timeout = int(chopchop_config.get("web_timeout", 180))
+    poll_sec = float(chopchop_config.get("web_poll_interval", 2))
+
+    chrom, pos, _strand = loc
+    gene_input = str(chopchop_config.get("gene_input", "")).strip()
+    flank = int(chopchop_config.get("window_padding", 80))
+    window_start = max(1, int(pos) - int(dist) - flank)
+    window_end = int(pos) + int(dist) + flank
+    target_seq = ""
+    if gene_input == "":
+        target_seq = fetch_sequence_from_ensembl(
+            chrom=chrom,
+            start=window_start,
+            end=window_end,
+            strand=1,
+            genome_ver=genome_ver,
+            timeout=int(chopchop_config.get("ensembl_timeout", 30)),
+        )
+
+    payload_json = chopchop_config.get("web_payload_json", "")
+    if payload_json:
+        payload = json.loads(payload_json)
+        payload["fastaInput"] = target_seq
+        payload["geneInput"] = payload.get("geneInput", "")
+    else:
+        payload = _default_chopchop_web_payload(
+            target_seq=target_seq,
+            genome_ver=genome_ver,
+            pam=pam,
+            chopchop_config=chopchop_config,
+            gene_input=gene_input,
+        )
+    _dump_chopchop_debug(
+        chopchop_config=chopchop_config,
+        source="raw_web",
+        chrom=chrom,
+        pos=pos,
+        window_start=window_start,
+        window_end=window_end,
+        target_seq=target_seq,
+        payload=payload,
+    )
+
+    submit_url = base_url + "/"
+    req = Request(
+        submit_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as response:
+        body = response.read().decode("utf-8", errors="ignore")
+        header_text = str(response.headers)
+        job_id = _extract_job_id_from_text(body) or _extract_job_id_from_text(header_text) or _extract_job_id_from_text(response.geturl())
+
+    if not job_id:
+        raise RuntimeError("CHOPCHOP job id not found in web submit response.")
+
+    results_url = urljoin(base_url + "/", f"results/{job_id}/results.tsv")
+    deadline = pd.Timestamp.utcnow().timestamp() + timeout
+    last_error = None
+    while pd.Timestamp.utcnow().timestamp() < deadline:
+        try:
+            req_results = Request(results_url, headers={"Accept": "*/*"})
+            with urlopen(req_results, timeout=30) as res:
+                txt = res.read().decode("utf-8", errors="ignore")
+            if "Target sequence" in txt or "Rank\t" in txt:
+                return pd.read_csv(StringIO(txt), sep="\t")
+        except Exception as exc:
+            last_error = exc
+        time.sleep(poll_sec)
+
+    raise RuntimeError(
+        f"Timed out waiting for CHOPCHOP raw web results ({results_url}). Last error: {last_error}"
+    )
+
+
+def get_gRNAs_near_loc(
+    loc,
+    dist,
+    loc2file_index,
+    genome_ver,
+    pam,
+    guide_source="precomputed",
+    chopchop_config=None,
+):
     """
     input
         loc: [chr,pos,strand]
         dist: max cut to loc distance
     return:
-        a dataframe of guide RNAs which cuts <[dist] to the loc, the columns are "seq","pam","start","end", "strand", "guideMITScore","guideCfdScore","guideCfdScorev2","guideCfdScorev3", "Eff_scores"
+        a dataframe of guide RNAs which cuts <[dist] to the loc, with columns in GUIDE_COLUMNS
     """
-    pam=pam.upper()
+    pam = pam.upper()
     chr = loc[0]
     pos = loc[1]
-    chr_dict = loc2file_index[chr]
-    target_files = []  # a list of file names containing gRNAs near loc
-    # lookup the file
-    for key in chr_dict.keys():
-        file_start = key.split("-")[0]
-        file_end = key.split("-")[1]
-        interval = [file_start, file_end]
-        if (
-            in_interval(pos, interval)
-            or in_interval(pos - 1000, interval)
-            or in_interval(pos + 1000, interval)
-        ):
-            target_files.append(chr_dict[key])
-    # print(target_files)
-    # load the gRNAs in the file
-    dfs = []
-    for file in target_files:
-        file_path = os.path.join(
-            "precomputed_gRNAs",
-            f"gRNAs_{pam}",
-            f"gRNA_{genome_ver}",
-            "gRNA.tab.gz.split.BwaMapped.scored",
-            file,
-        )
-        df_tmp = pd.read_csv(
-            file_path,
-            sep="\t",
-            compression="infer",
-            header=None,
-            names=[
-                "seq",
-                "pam",
-                "start",
-                "end",
-                "strand",
-                "guideMITScore",
-                "guideCfdScore",
-                "guideCfdScorev2",
-                "guideCfdScorev3",
-                "Eff_scores",
-            ],
-        )
-        dfs.append(df_tmp)
-    df_gRNA = pd.concat(dfs)
+
+    if str(guide_source).lower() == "chopchop":
+        cmd_template = ""
+        if chopchop_config is not None:
+            cmd_template = chopchop_config.get("cmd_template", "")
+        if cmd_template:
+            df_gRNA = _run_chopchop_from_template(
+                loc=loc,
+                dist=dist,
+                genome_ver=genome_ver,
+                pam=pam,
+                chopchop_config=chopchop_config,
+            )
+        else:
+            df_gRNA = _run_chopchop_web(
+                loc=loc,
+                dist=dist,
+                genome_ver=genome_ver,
+                pam=pam,
+                chopchop_config=chopchop_config,
+            )
+    else:
+        if loc2file_index is None:
+            return _empty_guides_df()
+        chr_dict = loc2file_index[chr]
+        target_files = []  # a list of file names containing gRNAs near loc
+        # lookup the file
+        for key in chr_dict.keys():
+            file_start = key.split("-")[0]
+            file_end = key.split("-")[1]
+            interval = [file_start, file_end]
+            if (
+                in_interval(pos, interval)
+                or in_interval(pos - 1000, interval)
+                or in_interval(pos + 1000, interval)
+            ):
+                target_files.append(chr_dict[key])
+
+        dfs = []
+        for file in target_files:
+            file_path = os.path.join(
+                "precomputed_gRNAs",
+                f"gRNAs_{pam}",
+                f"gRNA_{genome_ver}",
+                "gRNA.tab.gz.split.BwaMapped.scored",
+                file,
+            )
+            df_tmp = pd.read_csv(
+                file_path,
+                sep="\t",
+                compression="infer",
+                header=None,
+                names=GUIDE_COLUMNS,
+            )
+            dfs.append(df_tmp)
+        if len(dfs) == 0:
+            return _empty_guides_df()
+        df_gRNA = pd.concat(dfs)
 
     # subset gRNA based on strand  !ATTN: start > end when strand is '-'
     df_gRNA_on_sense = df_gRNA[(df_gRNA["strand"] == "+")]
@@ -971,7 +1693,7 @@ def get_gRNAs_near_loc(loc, dist, loc2file_index, genome_ver, pam):
         & (df_gRNA_on_antisense["start"] < (pos + 17 + dist))
     ]
 
-    return pd.concat([df_gRNA_on_sense, df_gRNA_on_antisense])
+    return pd.concat([df_gRNA_on_sense, df_gRNA_on_antisense])[GUIDE_COLUMNS]
 
 
 def in_interval(pos, interval):
@@ -1043,6 +1765,18 @@ def get_seq(chr, start, end, strand, genome_ver):
         else:
             return subseq
     else:
+        use_ensembl_fallback = os.environ.get("PROTOSPACEJAM_USE_ENSEMBL_SEQ", "1")
+        if use_ensembl_fallback == "1":
+            log.warning(
+                f"Local genome pickle not found ({chr_file_path}); fetching region from Ensembl REST."
+            )
+            return fetch_sequence_from_ensembl(
+                chrom=chr,
+                start=start,
+                end=end - 1,
+                strand=strand,
+                genome_ver=genome_ver,
+            )
         sys.exit(f"ERROR: file not found: {chr_file_path}")
 
 

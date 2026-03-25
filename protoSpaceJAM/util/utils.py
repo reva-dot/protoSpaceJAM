@@ -23,6 +23,7 @@ from protoSpaceJAM.util.hdr import HDR_flank #uncomment this for pip installatio
 # from util.hdr import HDR_flank
 
 GUIDE_COLUMNS = [
+    "chr",
     "seq",
     "pam",
     "start",
@@ -33,7 +34,15 @@ GUIDE_COLUMNS = [
     "guideCfdScorev2",
     "guideCfdScorev3",
     "Eff_scores",
+    "MM0",
+    "MM1",
+    "MM2",
+    "MM3",
+    "chopchop_offtarget_penalty",
+    "chopchop_rank",
 ]
+
+GUIDE_EXPORT_COLUMNS = GUIDE_COLUMNS + ["score_note"]
 
 GENOME_TO_ENSEMBL = {
     "GRCh38": ("homo_sapiens", "GRCh38"),
@@ -532,6 +541,7 @@ def get_gRNAs_target_coordinate(
     )
     keep_chopchop_order = (
         str(guide_source).lower() == "chopchop"
+        and str(((chopchop_config or {}).get("scorer_config", {}) or {}).get("backend", "default")).lower() == "default"
         and not (chopchop_config or {}).get("psj_rank_chopchop", False)
     )
     if keep_chopchop_order:
@@ -553,6 +563,9 @@ def get_gRNAs_target_coordinate(
             spec_score_flavor=spec_score_flavor,
             reg_penalty=reg_penalty,
             alphas=alphas,
+            specificity_backend=str(((chopchop_config or {}).get("scorer_config", {}) or {}).get("backend", "default")),
+            chopchop_proxy_k=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_k", 600.0)),
+            chopchop_proxy_n=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_n", 1.0)),
         )
         ranked_df_gRNAs_ATG = ranked_df_gRNAs_target_pos.sort_values(
             "final_weight", ascending=False
@@ -609,8 +622,17 @@ def get_gRNAs(
         guide_source=guide_source,
         chopchop_config=chopchop_config,
     )
+    start_interval, start_region_label = _terminal_cds_region_for_terminus(ENST_ID, ENST_info, "start")
+    df_gRNAs_ATG = _filter_guides_to_terminal_cds(
+        ENST_ID=ENST_ID,
+        ENST_info=ENST_info,
+        gRNA_df=df_gRNAs_ATG,
+        terminus_type="start",
+    )
+    df_gRNAs_ATG = _annotate_guides_with_target_interval(df_gRNAs_ATG, start_region_label, start_interval)
     keep_chopchop_order = (
         str(guide_source).lower() == "chopchop"
+        and str(((chopchop_config or {}).get("scorer_config", {}) or {}).get("backend", "default")).lower() == "default"
         and not (chopchop_config or {}).get("psj_rank_chopchop", False)
     )
     if keep_chopchop_order:
@@ -631,7 +653,10 @@ def get_gRNAs(
             type="start",
             spec_score_flavor=spec_score_flavor,
             reg_penalty=reg_penalty,
-            alphas=alphas
+            alphas=alphas,
+            specificity_backend=str(((chopchop_config or {}).get("scorer_config", {}) or {}).get("backend", "default")),
+            chopchop_proxy_k=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_k", 600.0)),
+            chopchop_proxy_n=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_n", 1.0)),
         )
         ranked_df_gRNAs_ATG = ranked_df_gRNAs_ATG.sort_values(
             "final_weight", ascending=False
@@ -654,6 +679,14 @@ def get_gRNAs(
         guide_source=guide_source,
         chopchop_config=chopchop_config,
     )
+    stop_interval, stop_region_label = _terminal_cds_region_for_terminus(ENST_ID, ENST_info, "stop")
+    df_gRNAs_stop = _filter_guides_to_terminal_cds(
+        ENST_ID=ENST_ID,
+        ENST_info=ENST_info,
+        gRNA_df=df_gRNAs_stop,
+        terminus_type="stop",
+    )
+    df_gRNAs_stop = _annotate_guides_with_target_interval(df_gRNAs_stop, stop_region_label, stop_interval)
     if keep_chopchop_order:
         ranked_df_gRNAs_stop = _decorate_guides_for_hdr_without_reranking(
             loc=start_of_stop_loc,
@@ -672,7 +705,10 @@ def get_gRNAs(
             type="stop",
             spec_score_flavor=spec_score_flavor,
             reg_penalty=reg_penalty,
-            alphas=alphas
+            alphas=alphas,
+            specificity_backend=str(((chopchop_config or {}).get("scorer_config", {}) or {}).get("backend", "default")),
+            chopchop_proxy_k=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_k", 600.0)),
+            chopchop_proxy_n=float(((chopchop_config or {}).get("scorer_config", {}) or {}).get("chopchop_proxy_n", 1.0)),
         )
         ranked_df_gRNAs_stop = ranked_df_gRNAs_stop.sort_values(
             "final_weight", ascending=False
@@ -682,7 +718,7 @@ def get_gRNAs(
 
 
 def rank_gRNAs_for_tagging(
-    loc, gRNA_df, loc2posType, ENST_ID, ENST_strand, type, spec_score_flavor, reg_penalty, alphas=[1, 1, 1]
+    loc, gRNA_df, loc2posType, ENST_ID, ENST_strand, type, spec_score_flavor, reg_penalty, alphas=[1, 1, 1], specificity_backend="default", chopchop_proxy_k=600.0, chopchop_proxy_n=1.0
 ):
     """
     input:  loc         [chr,pos,strand]  #start < end
@@ -721,7 +757,14 @@ def rank_gRNAs_for_tagging(
 
         # calc. specificity_weight
         CSS = row[spec_score_flavor]
-        specificity_weight = _specificity_weight(CSS)
+        if str(specificity_backend).lower() == "chopchop_proxy":
+            penalty = pd.to_numeric(row.get("chopchop_offtarget_penalty", float("nan")), errors="coerce")
+            if pd.isna(penalty):
+                specificity_weight = 1.0
+            else:
+                specificity_weight = 1.0 / (1.0 + (float(penalty) / float(chopchop_proxy_k)) ** float(chopchop_proxy_n))
+        else:
+            specificity_weight = _specificity_weight(CSS)
         col_spec_weight.append(specificity_weight)
 
         # calc. distance_weight
@@ -806,13 +849,12 @@ def _decorate_guides_for_hdr_without_reranking(loc, gRNA_df, ENST_ID, ENST_stran
     gRNA_df["ID"] = ENST_ID
     gRNA_df["Insert_pos"] = insPos
     gRNA_df["Cut2Ins_dist"] = cut2insDist_list
-    # Neutral placeholders so downstream code remains compatible.
-    gRNA_df["spec_weight"] = 1.0
-    gRNA_df["dist_weight"] = 1.0
-    gRNA_df["pos_weight"] = 1.0
-    # Preserve current row order explicitly.
-    gRNA_df["final_weight"] = list(range(len(gRNA_df), 0, -1))
-    gRNA_df["final_pct_rank"] = gRNA_df["final_weight"].rank(pct=True)
+    # Preserve CHOPCHOP order while marking PSJ-only ranking fields as not computed.
+    gRNA_df["spec_weight"] = float("nan")
+    gRNA_df["dist_weight"] = float("nan")
+    gRNA_df["pos_weight"] = float("nan")
+    gRNA_df["final_weight"] = float("nan")
+    gRNA_df["final_pct_rank"] = float("nan")
     return gRNA_df
 
 
@@ -828,6 +870,60 @@ def get_cut_pos(start, strand):
             start - 16 - 1
         )  # -1 because we want the cutsite to be behind the pos (viewed in the +1 strand)
     return cutPos
+
+
+def _terminal_cds_region_for_terminus(ENST_ID, ENST_info, terminus_type):
+    my_transcript = ENST_info[ENST_ID]
+    cds_list = [feat for feat in my_transcript.features if feat.type == "CDS"]
+    if len(cds_list) == 0:
+        return (None, "CDS")
+    target_index = 0 if terminus_type == "start" else (len(cds_list) - 1)
+    target_cds = cds_list[target_index]
+    start = int(target_cds.location.start)
+    end = int(target_cds.location.end)
+    interval = [min(start, end), max(start, end)]
+    label = "CDS_exon1" if terminus_type == "start" else "CDS_terminal_exon"
+    return interval, label
+
+
+def _filter_guides_to_terminal_cds(ENST_ID, ENST_info, gRNA_df, terminus_type):
+    if gRNA_df is None or gRNA_df.empty:
+        return gRNA_df
+    interval, _ = _terminal_cds_region_for_terminus(ENST_ID, ENST_info, terminus_type)
+    if interval is None:
+        return gRNA_df
+    lo, hi = int(interval[0]), int(interval[1])
+    tmp = gRNA_df.copy()
+    tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+    tmp = tmp[
+        pd.to_numeric(tmp["_cut_pos"], errors="coerce").notna()
+        & (pd.to_numeric(tmp["_cut_pos"], errors="coerce") >= lo)
+        & (pd.to_numeric(tmp["_cut_pos"], errors="coerce") <= hi)
+    ]
+    return tmp.drop(columns=["_cut_pos"], errors="ignore")
+
+
+def _annotate_guides_with_target_interval(gRNA_df, region_label, interval):
+    if gRNA_df is None or gRNA_df.empty:
+        return gRNA_df
+    out = gRNA_df.copy()
+    out["target_region_label"] = str(region_label)
+    if interval is None:
+        out["target_region_start"] = float("nan")
+        out["target_region_end"] = float("nan")
+        out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+        out["cut_in_target_region"] = float("nan")
+        return out
+    lo, hi = int(interval[0]), int(interval[1])
+    out["target_region_start"] = lo
+    out["target_region_end"] = hi
+    out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+    out["cut_in_target_region"] = (
+        pd.to_numeric(out["cut_pos"], errors="coerce").notna()
+        & (pd.to_numeric(out["cut_pos"], errors="coerce") >= lo)
+        & (pd.to_numeric(out["cut_pos"], errors="coerce") <= hi)
+    )
+    return out
 
 
 def _get_position_type(chr, ID, pos, loc2posType):
@@ -1053,22 +1149,23 @@ def get_start_stop_loc(ENST_ID, ENST_info):
         CDS_first = cdsList[
             1
         ]  # use the second cds if ATG is at the end of the first exon
-    # get start codon location
+    # cdsList is in transcript order, so the first CDS contains the start codon
+    # and the last CDS contains the stop codon for both strands.
     if CDS_first.strand == 1:
         ATG_loc = [
             CDS_first.location.ref,
             CDS_first.location.start + 0,
             CDS_first.location.start + 2,
             1,
-        ]  # format [start, end, strand]
+        ]
     else:
-        stop_loc = [
+        ATG_loc = [
             CDS_first.location.ref,
-            CDS_first.location.start + 0,
-            CDS_first.location.start + 2,
+            CDS_first.location.end - 2,
+            CDS_first.location.end + 0,
             -1,
         ]
-    # get stop codon location
+
     if CDS_last.strand == 1:
         stop_loc = [
             CDS_last.location.ref,
@@ -1077,13 +1174,12 @@ def get_start_stop_loc(ENST_ID, ENST_info):
             1,
         ]
     else:
-        ATG_loc = [
+        stop_loc = [
             CDS_last.location.ref,
-            CDS_last.location.end - 2,
-            CDS_last.location.end + 0,
+            CDS_last.location.start + 0,
+            CDS_last.location.start + 2,
             -1,
         ]
-
     return [ATG_loc, stop_loc]
 
 
@@ -1103,29 +1199,243 @@ def _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver):
     chrom = _canonize_chromosome(chrom)
     strand_num = 1 if str(strand) in ("1", "+", "plus") else -1
     region = f"{chrom}:{int(start)}..{int(end)}:{strand_num}"
-    return f"https://rest.ensembl.org/sequence/region/{species}/{region}?content-type=application/json"
+    return f"https://rest.ensembl.org/sequence/region/{species}/{region}"
 
 
-def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=30):
+def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=30, max_retries=5):
     url = _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver)
-    req = Request(url, headers={"Accept": "application/json", "Content-Type": "application/json"})
-    try:
-        with urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Unable to fetch sequence from Ensembl ({url}): {exc}") from exc
-    if "seq" not in data:
-        raise RuntimeError(f"Ensembl sequence response missing 'seq' for {chrom}:{start}-{end}")
-    return data["seq"].upper()
+    last_exc = None
+    for attempt in range(max(1, int(max_retries))):
+        req = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "protoSpaceJAM/ensembl-seq-fetch",
+            },
+        )
+        try:
+            with urlopen(req, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if "seq" not in data:
+                raise RuntimeError(
+                    f"Ensembl sequence response missing 'seq' for {chrom}:{start}-{end}"
+                )
+            return data["seq"].upper()
+        except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
+            last_exc = exc
+            is_http_5xx = isinstance(exc, HTTPError) and 500 <= int(exc.code) < 600
+            is_retryable = is_http_5xx or isinstance(exc, (URLError, TimeoutError))
+            if attempt >= int(max_retries) - 1 or not is_retryable:
+                break
+            time.sleep(min(2 ** attempt, 8))
+    raise RuntimeError(f"Unable to fetch sequence from Ensembl ({url}): {last_exc}") from last_exc
 
 
 def _best_numeric_series(df, candidates, default_value):
     for name in candidates:
-        if name in df.columns:
-            out = pd.to_numeric(df[name], errors="coerce")
+        col_name = _find_column_case_insensitive(df, [name])
+        if col_name is not None:
+            out = pd.to_numeric(df[col_name], errors="coerce")
             if out.notna().any():
                 return out
     return pd.Series([default_value] * len(df), index=df.index, dtype=float)
+
+
+def _find_column_case_insensitive(df, candidate_names):
+    cols = {str(c).lower().strip(): c for c in df.columns}
+    for name in candidate_names:
+        key = str(name).lower().strip()
+        if key in cols:
+            return cols[key]
+    return None
+
+
+def _extract_chopchop_offtarget_penalty(df_raw):
+    mm0_col = _find_column_case_insensitive(df_raw, ["MM0"])
+    mm1_col = _find_column_case_insensitive(df_raw, ["MM1"])
+    mm2_col = _find_column_case_insensitive(df_raw, ["MM2"])
+    mm3_col = _find_column_case_insensitive(df_raw, ["MM3"])
+    if all(col is None for col in [mm0_col, mm1_col, mm2_col, mm3_col]):
+        return pd.Series([float("nan")] * len(df_raw), index=df_raw.index, dtype=float)
+
+    mm0 = pd.to_numeric(df_raw[mm0_col], errors="coerce") if mm0_col is not None else 0.0
+    mm1 = pd.to_numeric(df_raw[mm1_col], errors="coerce") if mm1_col is not None else 0.0
+    mm2 = pd.to_numeric(df_raw[mm2_col], errors="coerce") if mm2_col is not None else 0.0
+    mm3 = pd.to_numeric(df_raw[mm3_col], errors="coerce") if mm3_col is not None else 0.0
+
+    if not isinstance(mm0, pd.Series):
+        mm0 = pd.Series([mm0] * len(df_raw), index=df_raw.index, dtype=float)
+    if not isinstance(mm1, pd.Series):
+        mm1 = pd.Series([mm1] * len(df_raw), index=df_raw.index, dtype=float)
+    if not isinstance(mm2, pd.Series):
+        mm2 = pd.Series([mm2] * len(df_raw), index=df_raw.index, dtype=float)
+    if not isinstance(mm3, pd.Series):
+        mm3 = pd.Series([mm3] * len(df_raw), index=df_raw.index, dtype=float)
+
+    penalty = (
+        1000.0 * mm0.fillna(0.0)
+        + 800.0 * mm1.fillna(0.0)
+        + 600.0 * mm2.fillna(0.0)
+        + 400.0 * mm3.fillna(0.0)
+    )
+    return penalty.astype(float)
+
+
+def _run_crispor_scores(df_guides, genome_ver, pam, scorer_config):
+    if scorer_config is None or str(scorer_config.get("backend", "default")).lower() != "crispor":
+        return None
+
+    cmd_template = str(scorer_config.get("cmd_template", "")).strip()
+    if cmd_template == "":
+        raise RuntimeError(
+            "specificity_backend=crispor requires --crispor_cmd_template."
+        )
+
+    df_input = df_guides.copy()
+    df_input["seq"] = df_input["seq"].astype(str).str.upper()
+    df_input["pam"] = df_input["pam"].astype(str).str.upper()
+    max_guides = scorer_config.get("max_guides", None) if scorer_config is not None else None
+    try:
+        if max_guides is not None:
+            max_guides = int(max_guides)
+    except Exception:
+        max_guides = None
+    if max_guides is not None and max_guides > 0:
+        df_input = df_input.head(max_guides).copy()
+
+    with tempfile.TemporaryDirectory(prefix="protospacejam_crispor_") as temp_dir:
+        input_file = os.path.join(temp_dir, "guides_for_crispor.tsv")
+        output_file = os.path.join(temp_dir, "crispor_scores.tsv")
+        export_cols = [c for c in ["chr", "seq", "pam", "start", "end", "strand"] if c in df_input.columns]
+        df_input[export_cols].to_csv(
+            input_file,
+            sep="\t",
+            index=False,
+        )
+        command = cmd_template.format(
+            input_file=input_file,
+            output_file=output_file,
+            output_dir=temp_dir,
+            genome=genome_ver or "",
+            pam=pam,
+        )
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            err_text = (proc.stderr or "").strip()
+            out_text = (proc.stdout or "").strip()
+            detail = "\n".join([x for x in [err_text, out_text] if x])
+            raise RuntimeError(
+                "CRISPOR scoring command failed with exit code "
+                f"{proc.returncode}: {detail}"
+            )
+        if not os.path.isfile(output_file):
+            raise RuntimeError(
+                f"CRISPOR scoring command did not produce expected output file: {output_file}"
+            )
+        df_scores = pd.read_csv(output_file, sep=None, engine="python", dtype=str)
+
+    if df_scores.empty:
+        return None
+
+    seq_col = _find_column_case_insensitive(
+        df_scores,
+        ["seq", "guide", "guideSeq", "target", "sgrna", "grna_seq"],
+    )
+    pam_col = _find_column_case_insensitive(
+        df_scores,
+        ["pam", "pamSeq", "pam_sequence"],
+    )
+    mit_col = _find_column_case_insensitive(
+        df_scores,
+        ["guideMITScore", "mitSpecScore", "mit_score", "mitscore", "specificity"],
+    )
+    cfd_col = _find_column_case_insensitive(
+        df_scores,
+        ["guideCfdScore", "cfdSpecScore", "cfd_score", "cfdscore"],
+    )
+    if seq_col is None:
+        raise RuntimeError("CRISPOR score output must include a guide sequence column.")
+    if mit_col is None and cfd_col is None:
+        raise RuntimeError(
+            "CRISPOR score output must include at least one MIT or CFD score column."
+        )
+
+    df_scores = df_scores.copy()
+    df_scores["_seq_key"] = (
+        df_scores[seq_col].astype(str).str.upper().str.replace(r"[^ACGTN]", "", regex=True)
+    )
+    if pam_col is not None:
+        df_scores["_pam_key"] = (
+            df_scores[pam_col].astype(str).str.upper().str.replace(r"[^ACGTN]", "", regex=True)
+        )
+    else:
+        df_scores["_pam_key"] = ""
+
+    keep_cols = ["_seq_key", "_pam_key"]
+    if mit_col is not None:
+        df_scores["guideMITScore"] = pd.to_numeric(df_scores[mit_col], errors="coerce")
+        keep_cols.append("guideMITScore")
+    if cfd_col is not None:
+        df_scores["guideCfdScore"] = pd.to_numeric(df_scores[cfd_col], errors="coerce")
+        keep_cols.append("guideCfdScore")
+    return df_scores[keep_cols].drop_duplicates(subset=["_seq_key", "_pam_key"], keep="first")
+
+
+def _apply_external_specificity_scores(df_guides, genome_ver, pam, scorer_config):
+    df = df_guides.copy()
+    mit_scores = _best_numeric_series(
+        df,
+        ["guideMITScore", "mitscore", "mit_score", "specificity", "offtargetscore"],
+        float("nan"),
+    )
+    cfd_scores = _best_numeric_series(
+        df,
+        ["guideCfdScore", "cfdscore", "cfd_score", "cfdspecscore"],
+        float("nan"),
+    )
+    score_note = ""
+
+    backend = str((scorer_config or {}).get("backend", "default")).lower()
+
+    if backend == "crispor":
+        df["_seq_key"] = df["seq"].astype(str).str.upper().str.replace(r"[^ACGTN]", "", regex=True)
+        df["_pam_key"] = df["pam"].astype(str).str.upper().str.replace(r"[^ACGTN]", "", regex=True)
+        df_scores = _run_crispor_scores(df, genome_ver=genome_ver, pam=pam, scorer_config=scorer_config)
+        if df_scores is not None and not df_scores.empty:
+            merged = df.merge(df_scores, how="left", on=["_seq_key", "_pam_key"], suffixes=("", "_crispor"))
+            if "guideMITScore_crispor" in merged.columns:
+                mit_scores = pd.to_numeric(merged["guideMITScore_crispor"], errors="coerce")
+            if "guideCfdScore_crispor" in merged.columns:
+                cfd_scores = pd.to_numeric(merged["guideCfdScore_crispor"], errors="coerce")
+            df = merged
+            df = df.drop(columns=[c for c in ["guideMITScore_crispor", "guideCfdScore_crispor"] if c in df.columns])
+            note_parts = []
+            if mit_scores.notna().any():
+                note_parts.append("guideMITScore=CRISPOR")
+            if cfd_scores.notna().any():
+                note_parts.append("guideCfdScore=CRISPOR")
+            score_note = "; ".join(note_parts)
+        df = df.drop(columns=[c for c in ["_seq_key", "_pam_key"] if c in df.columns])
+
+    if backend == "chopchop_proxy":
+        score_note = "spec_weight=CHOPCHOP_proxy_penalty; guideMITScore=compat_default"
+    elif score_note == "":
+        if mit_scores.notna().any():
+            score_note = "guideMITScore=source_table"
+        else:
+            score_note = "guideMITScore=not_computed"
+
+    df["guideMITScore"] = pd.to_numeric(mit_scores, errors="coerce")
+    df["guideCfdScore"] = cfd_scores
+    df["guideCfdScorev2"] = pd.Series([float("nan")] * len(df), index=df.index, dtype=float)
+    df["guideCfdScorev3"] = pd.Series([float("nan")] * len(df), index=df.index, dtype=float)
+    df["score_note"] = score_note
+    return df
 
 
 def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
@@ -1160,6 +1470,12 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     for key in ["pam", "pamseq", "pam_sequence"]:
         if key.lower() in cols:
             pam_col = cols[key.lower()]
+            break
+
+    rank_col = None
+    for key in ["rank", "ranking"]:
+        if key.lower() in cols:
+            rank_col = cols[key.lower()]
             break
 
     genomic_loc_col = None
@@ -1206,6 +1522,14 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
         end = end.where(~minus_mask, start - seq_len + 1)
 
     df = pd.DataFrame(index=df_raw.index)
+    df["chr"] = str(chr_name) if chr_name is not None else ""
+    if genomic_loc_col is not None:
+        extracted_chr = (
+            df_raw[genomic_loc_col]
+            .astype(str)
+            .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")["chr"]
+        )
+        df["chr"] = extracted_chr.fillna(df["chr"])
     seq_guess = full_seq.where(full_seq.str.len() <= 20, full_seq.str.slice(0, 20))
     pam_guess = full_seq.where(full_seq.str.len() < 23, full_seq.str.slice(-3))
     df["seq"] = seq_guess
@@ -1214,22 +1538,29 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     df["end"] = end.round().astype("Int64")
     df["strand"] = strand
 
-    # Match historical column names used by downstream ranking.
-    mit_scores = _best_numeric_series(
-        df_raw,
-        ["guideMITScore", "mitscore", "mit_score", "specificity", "offtargetscore", "score"],
-        50.0,
-    )
     eff_scores = _best_numeric_series(
         df_raw,
-        ["eff_score", "efficiency", "doench", "eff_scores", "score"],
+        ["eff_score", "efficiency", "doench", "eff_scores"],
         0.0,
     )
-    df["guideMITScore"] = mit_scores.clip(lower=0, upper=100)
-    df["guideCfdScore"] = mit_scores.clip(lower=0, upper=100)
-    df["guideCfdScorev2"] = mit_scores.clip(lower=0, upper=100)
-    df["guideCfdScorev3"] = mit_scores.clip(lower=0, upper=100)
     df["Eff_scores"] = eff_scores
+    for mm_name in ["MM0", "MM1", "MM2", "MM3"]:
+        mm_col = _find_column_case_insensitive(df_raw, [mm_name])
+        if mm_col is not None:
+            df[mm_name] = pd.to_numeric(df_raw[mm_col], errors="coerce")
+        else:
+            df[mm_name] = pd.Series([float("nan")] * len(df), index=df.index, dtype=float)
+    df["chopchop_offtarget_penalty"] = _extract_chopchop_offtarget_penalty(df_raw)
+    if rank_col is not None:
+        df["chopchop_rank"] = pd.to_numeric(df_raw[rank_col], errors="coerce")
+    else:
+        df["chopchop_rank"] = pd.Series(range(1, len(df) + 1), index=df.index, dtype=float)
+    df = _apply_external_specificity_scores(
+        df,
+        genome_ver=None,
+        pam=pam,
+        scorer_config=None,
+    )
 
     # Keep legacy convention: for '-' guides, start > end.
     neg = df["strand"] == "-"
@@ -1248,10 +1579,18 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     df["start"] = df["start"].astype(int)
     df["end"] = df["end"].astype(int)
     df["strand"] = df["strand"].where(df["strand"].isin(["+", "-"]), "+")
-    return df[GUIDE_COLUMNS]
+    return df[GUIDE_EXPORT_COLUMNS]
 
 
-def convert_chopchop_raw_to_psj(df_raw, pam, window_start=1, desired_insert_pos=None, default_chr=None):
+def convert_chopchop_raw_to_psj(
+    df_raw,
+    pam,
+    window_start=1,
+    desired_insert_pos=None,
+    default_chr=None,
+    genome_ver=None,
+    scorer_config=None,
+):
     """
     Convert raw CHOPCHOP results.tsv table to protoSpaceJAM guide schema.
     Keeps CHOPCHOP order.
@@ -1261,6 +1600,12 @@ def convert_chopchop_raw_to_psj(df_raw, pam, window_start=1, desired_insert_pos=
         chr_name=default_chr or "",
         pam=pam,
         window_start=window_start,
+    )
+    df = _apply_external_specificity_scores(
+        df,
+        genome_ver=genome_ver,
+        pam=pam,
+        scorer_config=scorer_config,
     )
     # Fill chromosome from CHOPCHOP raw genomic location when available.
     cols = {c.lower().strip(): c for c in df_raw.columns}
@@ -1347,11 +1692,17 @@ def _run_chopchop_from_template(loc, dist, genome_ver, pam, chopchop_config):
             )
 
         df_raw = pd.read_csv(output_file, sep=None, engine="python")
-        return _standardize_chopchop_df(
+        df = _standardize_chopchop_df(
             df_raw=df_raw,
             chr_name=chrom,
             pam=pam,
             window_start=window_start,
+        )
+        return _apply_external_specificity_scores(
+            df,
+            genome_ver=genome_ver,
+            pam=pam,
+            scorer_config=(chopchop_config or {}).get("scorer_config"),
         )
 
 
@@ -1390,7 +1741,7 @@ def _default_chopchop_web_payload(target_seq, genome_ver, pam, chopchop_config, 
         "fastaInput": "" if gene_input else target_seq,
         "geneInput": gene_input,
         "isIsoform": False,
-        "forSelect": str(chopchop_config.get("for_select", "knock-out")),
+        "forSelect": str(chopchop_config.get("for_select", "knock-in")),
     }
 
 
@@ -1497,11 +1848,17 @@ def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
                 except Exception:
                     pass
                 win_start = window_start if gene_input == "" else 1
-                return _standardize_chopchop_df(
+                df = _standardize_chopchop_df(
                     df_raw=df_raw,
                     chr_name=chrom,
                     pam=pam,
                     window_start=win_start,
+                )
+                return _apply_external_specificity_scores(
+                    df,
+                    genome_ver=genome_ver,
+                    pam=pam,
+                    scorer_config=(chopchop_config or {}).get("scorer_config"),
                 )
         except Exception as exc:
             last_error = exc
@@ -1620,6 +1977,7 @@ def get_gRNAs_near_loc(
     pam = pam.upper()
     chr = loc[0]
     pos = loc[1]
+    use_cut_distance_filter = False
 
     if str(guide_source).lower() == "chopchop":
         cmd_template = ""
@@ -1634,13 +1992,22 @@ def get_gRNAs_near_loc(
                 chopchop_config=chopchop_config,
             )
         else:
-            df_gRNA = _run_chopchop_web(
-                loc=loc,
-                dist=dist,
-                genome_ver=genome_ver,
+            df_gRNA = convert_chopchop_raw_to_psj(
+                df_raw=get_chopchop_raw_results(
+                    loc=loc,
+                    dist=dist,
+                    genome_ver=genome_ver,
+                    pam=pam,
+                    chopchop_config=chopchop_config,
+                ),
                 pam=pam,
-                chopchop_config=chopchop_config,
+                window_start=1,
+                desired_insert_pos=int(pos),
+                default_chr=str(chr),
+                genome_ver=genome_ver,
+                scorer_config=(chopchop_config or {}).get("scorer_config"),
             )
+            use_cut_distance_filter = True
     else:
         if loc2file_index is None:
             return _empty_guides_df()
@@ -1678,6 +2045,14 @@ def get_gRNAs_near_loc(
         if len(dfs) == 0:
             return _empty_guides_df()
         df_gRNA = pd.concat(dfs)
+
+    if use_cut_distance_filter:
+        tmp = df_gRNA.copy()
+        tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+        tmp["_abs_cut2ins"] = pd.to_numeric(tmp["_cut_pos"], errors="coerce").sub(float(pos)).abs()
+        tmp = tmp[tmp["_abs_cut2ins"].notna()]
+        tmp = tmp[tmp["_abs_cut2ins"] <= float(dist)]
+        return tmp.drop(columns=["_cut_pos", "_abs_cut2ins"], errors="ignore")[GUIDE_COLUMNS]
 
     # subset gRNA based on strand  !ATTN: start > end when strand is '-'
     df_gRNA_on_sense = df_gRNA[(df_gRNA["strand"] == "+")]

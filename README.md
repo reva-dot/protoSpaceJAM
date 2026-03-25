@@ -88,3 +88,88 @@ protoSpaceJAM --path2csv input/test_input.csv --outdir output/test
 &nbsp;
 ## License
 Distributed under the terms of the BSD-3 license, "protoSpaceJAM" is free and open source software
+## CSV Input Template
+
+A fill-in template is available at `input/multi_target_template.csv`.
+
+The input CSV now supports three targeting modes per row:
+- Transcript terminus targeting with `Target_terminus` set to `N`, `C`, or `ALL`
+- Explicit coordinate targeting with `Chromosome` and `Coordinate`
+- Preferred-region targeting with `Preferred_region` and optional region-specific columns
+
+### Required column
+- `Ensembl_ID`: transcript ID used for annotation, guide retrieval, and donor design
+
+### Optional columns
+- `Entry`: custom row label written into outputs
+- `Gene_Name`: gene symbol used for CHOPCHOP web gene-based queries
+- `Target_terminus`: `N`, `C`, or `ALL` for standard CDS-anchored start/stop tagging
+- `Chromosome`: chromosome name for explicit coordinate targeting
+- `Coordinate`: genomic coordinate for explicit coordinate targeting
+- `Preferred_region`: one of `exon`, `5UTR`, `3UTR`, `CDS`, or `transcript`
+- `Preferred_region=CDS` is the coding-only option and is the recommended default for knock-in/knock-out rescue designs
+- If you use the preferred-region mode but leave `Preferred_region` blank, protoSpaceJAM now defaults that mode to `CDS`
+- `Preferred_exon`: exon number, required when `Preferred_region=exon`
+- `Preferred_anchor`: one of `start`, `center`, or `end` (default: `center`)
+- `Preferred_offset`: integer offset applied in transcript orientation after the anchor is chosen
+
+### Precedence
+- If `Chromosome` and `Coordinate` are filled, those are used directly.
+- Otherwise, if `Preferred_region` is filled, protoSpaceJAM resolves that region to a coordinate first and then runs the existing coordinate-based workflow.
+- Do not mix `Chromosome`/`Coordinate` with `Preferred_region` on the same row; explicit coordinates take precedence and override region targeting.
+- Otherwise, `Target_terminus` is used for standard N/C/ALL transcript tagging at CDS boundaries by default.
+
+### Default behavior
+- Standard `Target_terminus=N` targets the CDS start / ATG boundary, not the first base of exon 1.
+- Standard `Target_terminus=C` targets the CDS end / stop-codon boundary.
+- `Preferred_region=exon` is exon-wide and may include UTR sequence if that exon contains UTR bases.
+- `Preferred_region=CDS` uses coding sequence only. If you also provide `Preferred_exon`, protoSpaceJAM resolves the CDS segment of that exon, e.g. `Preferred_region=CDS` + `Preferred_exon=1` means the CDS portion of exon 1.
+- Use `Preferred_region=CDS` when you want the resolved cut/insert site to stay in coding sequence.
+
+### Region-targeting notes
+- If you specify `Preferred_region`, that is the main targeting instruction; `Target_terminus` becomes mostly descriptive unless you leave the region blank.
+- `Preferred_anchor` controls which side of the requested region is used, always in transcript orientation: `start`, `center`, or `end`.
+- If you want the start of the 3' UTR, use `Preferred_region=3UTR` and `Preferred_anchor=start`. Do not rely on `Target_terminus=N/C` to steer a preferred-region request.
+- Current region support is: `exon`, `CDS`, `5UTR`, `3UTR`, and `transcript`. Intron targeting is not implemented yet.
+- The guide/output tables include `target_region_label`, `target_region_start`, `target_region_end`, and `cut_pos` so you can verify that the chosen guide cut lands where you intended.
+
+### Example rows
+```csv
+Entry,Ensembl_ID,Gene_Name,Target_terminus,Chromosome,Coordinate,Preferred_region,Preferred_exon,Preferred_anchor,Preferred_offset
+1,ENST00000334409.10,PDCD1,ALL,,,,,,
+2,ENST00000334409.10,PDCD1,,,,CDS,,start,0
+3,ENST00000334409.10,PDCD1,,,,exon,1,center,0
+4,ENST00000334409.10,PDCD1,,,,5UTR,,center,0
+5,ENST00000614167.2,B2M,C,,,,,,
+6,ENST00000614167.2,B2M,,,,3UTR,,end,-20
+7,ENST00000334409.10,PDCD1,,chr2,241849884,,,,
+```
+
+### New homology arm export
+Each run now writes `homology_arms.csv` in the output directory with:
+- `Entry`
+- `ID`
+- `terminus`
+- `design_rank`
+- `gRNA_name`
+- `gRNA_seq`
+- `insert_pos`
+- `left_HA`
+- `payload`
+- `right_HA`
+- `donor_final`
+
+### Ensembl region audit export
+When Ensembl annotation is used, protoSpaceJAM now writes a normalized region sidecar file into `--ensembl_cache_dir` (by default `<outdir>/ensembl_cache`).
+
+For each transcript, you will see files like:
+- `GRCh38_ENST00000611116.annotation.json`: raw transcript span/exon/CDS/UTR annotation bundle from Ensembl REST
+- `GRCh38_ENST00000611116.regions.json`: normalized region map derived from that bundle and used by protoSpaceJAM for preferred-region resolution
+
+The `.regions.json` file includes:
+- transcript-wide interval
+- full `CDS`, `5UTR`, and `3UTR` intervals
+- transcript-ordered exon intervals (`exon1`, `exon2`, ...)
+- CDS-within-exon intervals (`CDS_exon1`, `CDS_exon2`, ...)
+
+This is the file to inspect when you want to verify exactly which region coordinates protoSpaceJAM used for requests like `Preferred_region=CDS` + `Preferred_exon=1`.

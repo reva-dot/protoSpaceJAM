@@ -1,4 +1,5 @@
 import datetime
+import io
 import linecache
 import logging
 import os.path
@@ -35,7 +36,7 @@ def parse_args(test_mode=False):
         "--path2csv",
         default=os.path.join("input","test_input.csv"),
         type=str,
-        help="Path to a csv file containing the input knock-in sites, see input/test_input.csv for an example\n *required columns*: 'Ensembl_ID' (specifying the transcript ID), and either 'Target_terminus' or 'Chromosome','Coordinate' (specifying the terminus of the transcript or a genomic coordinate in the transcript)",
+        help="Path to a csv file containing the input knock-in sites, see input/test_input.csv for an example\n *required columns*: 'Ensembl_ID'\n coordinate-based rows use: 'Chromosome','Coordinate'\n transcript-terminus rows use: 'Target_terminus'\n optional region-targeting columns: 'Preferred_region','Preferred_exon','Preferred_anchor','Preferred_offset','Gene_Name'",
         metavar="<PATH_TO_CSV>",
     )
     IO.add_argument(
@@ -247,6 +248,34 @@ def parse_args(test_mode=False):
         type=float,
         help="raise the position weight to the power of this number, default: 1.0, range: [0,1]",
         metavar="<float>",
+    )
+    gRNA.add_argument(
+        "--specificity_backend",
+        default="default",
+        type=str,
+        help="Specificity scoring backend for CHOPCHOP-derived guides: default, chopchop_proxy, or crispor (default: default)",
+        metavar="<string>",
+    )
+    gRNA.add_argument(
+        "--chopchop_proxy_k",
+        default=600.0,
+        type=float,
+        help="Half-penalty point for the CHOPCHOP proxy weight: weight = 1/(1 + (penalty/K)^n) (default: 600)",
+        metavar="<float>",
+    )
+    gRNA.add_argument(
+        "--chopchop_proxy_n",
+        default=1.0,
+        type=float,
+        help="Steepness exponent n for the CHOPCHOP proxy weight (default: 1.0)",
+        metavar="<float>",
+    )
+    gRNA.add_argument(
+        "--crispor_cmd_template",
+        default="",
+        type=str,
+        help="Optional local command template used to score guides with CRISPOR. Must write a tabular file at {output_file}. Template variables: {input_file},{output_file},{output_dir},{genome},{pam}",
+        metavar="<string>",
     )
     payload = parser.add_argument_group('payload')
     payload.add_argument(
@@ -476,6 +505,7 @@ def main(custom_args=None):
 
         # Resolve optional payload inputs from files before payload parsing.
         resolve_payload_inputs_from_files(config)
+        validate_payload_inputs(config, log)
 
         # Exit if no arguments provided and not in test mode
         if len(sys.argv)==1 and config["test_mode"] == False:
@@ -504,6 +534,14 @@ def main(custom_args=None):
             "debug_dump": config["chopchop_debug_dump"],
             "debug_outdir": outdir,
             "psj_rank_chopchop": config["psj_rank_chopchop"],
+            "guides_only": config["guides_only"],
+            "scorer_config": {
+                "backend": config["specificity_backend"],
+                "cmd_template": config["crispor_cmd_template"],
+                "max_guides": config["num_gRNA_per_design"],
+                "chopchop_proxy_k": config["chopchop_proxy_k"],
+                "chopchop_proxy_n": config["chopchop_proxy_n"],
+            },
         }
         syn_check_args = {
             "check_enzymes": config["CheckEnzymes"],
@@ -575,6 +613,11 @@ def main(custom_args=None):
             sys.exit("PAM must be NGG, NGA or TTTV, please correct the issue and try again")
         if guide_source not in ["precomputed", "chopchop"]:
             sys.exit("guide_source must be precomputed or chopchop")
+        specificity_backend = str(config["specificity_backend"]).lower()
+        if specificity_backend not in ["default", "chopchop_proxy", "crispor"]:
+            sys.exit("specificity_backend must be default, chopchop_proxy, or crispor")
+        if specificity_backend == "crispor" and str(config["crispor_cmd_template"]).strip() == "":
+            sys.exit("specificity_backend=crispor requires --crispor_cmd_template")
         if str(config["input_mode"]).lower() not in ["csv", "direct"]:
             sys.exit("--input_mode must be csv or direct")
         annotation_source = str(config.get("annotation_source", "auto")).lower().strip()
@@ -662,7 +705,7 @@ def main(custom_args=None):
             df = load_input_dataframe(config=config, outdir=outdir, log=log)
             guides_out = open(f"{outdir}/guides_from_{guide_source}.csv", "w")
             guides_out.write(
-                "Entry,ID,terminus,rank,chr,insert_pos,seq,pam,start,end,strand,guideMITScore,guideCfdScore,guideCfdScorev2,guideCfdScorev3,Eff_scores,Cut2Ins_dist,spec_weight,dist_weight,pos_weight,final_weight\n"
+                "Entry,ID,terminus,rank,chopchop_rank,chr,insert_pos,seq,pam,start,end,strand,cut_pos,target_region_label,target_region_start,target_region_end,Eff_scores,MM0,MM1,MM2,MM3,Cut2Ins_dist\n"
             )
             chopchop_raw_all = []
             enst_insert_cache = {}
@@ -705,6 +748,8 @@ def main(custom_args=None):
                             window_start=1,
                             desired_insert_pos=(int(coordinate) if has_coord else None),
                             default_chr=(chrom if has_coord else None),
+                            genome_ver=config["genome_ver"],
+                            scorer_config=this_chopchop_cfg.get("scorer_config"),
                         )
                         out_id = enst_id if enst_id != "" else gene_name
                         row_term = str(row.get("Target_terminus", "ALL")).strip().upper()
@@ -778,7 +823,7 @@ def main(custom_args=None):
                             guide_source=guide_source,
                             chopchop_config=this_chopchop_cfg,
                         )
-                        if "guideMITScore" in guides_df.columns:
+                        if str(config["specificity_backend"]).lower() != "default" and "guideMITScore" in guides_df.columns:
                             guides_df = guides_df.sort_values(
                                 "guideMITScore", ascending=False
                             ).reset_index(drop=True)
@@ -900,27 +945,32 @@ def main(custom_args=None):
         # open log files
         mkdir(outdir)
         mkdir(os.path.join(outdir, "genbank_files"))
-        recut_CFD_all = open(os.path.join(outdir, "recut_CFD_all.txt"), "w")
-        recut_CFD_fail = open(os.path.join(outdir, "recut_CFD_fail.txt"), "w")
-        csvout_N = open(os.path.join(outdir, "out_Nterm_recut_cfd.csv"), "w")
-        csvout_C = open(os.path.join(outdir, "out_Cterm_recut_cfd.csv"), "w")
+        # Legacy CFD and fiveUTR side outputs are kept in-memory to avoid cluttering the output directory.
+        recut_CFD_all = io.StringIO()
+        recut_CFD_fail = io.StringIO()
+        csvout_N = io.StringIO()
+        csvout_C = io.StringIO()
         csvout_header = "ID,cfd1,cfd2,cfd3,cfd4,cfdScan,cfdScanNoRecode,cfd_max\n"
         csvout_N.write(csvout_header)
         csvout_C.write(csvout_header)
-        fiveUTR_log = open(os.path.join(outdir, "fiveUTR.txt"), "w")
+        fiveUTR_log = io.StringIO()
+        ha_out = open(os.path.join(outdir, "homology_arms.csv"), "w")
+        ha_out.write(
+            "Entry,ID,terminus,design_rank,gRNA_name,gRNA_seq,insert_pos,left_HA,payload,right_HA,donor_final\n"
+        )
 
         # open result file and write header
         csvout_res = open(f"{outdir}/result.csv", "w")
         csvout_res.write(
-            f"Entry,ID,chr,transcript_type,name,terminus,design_rank,gRNA_name,gRNA_seq,PAM,gRNA_start,gRNA_end,gRNA_cut_pos,edit_pos,distance_between_cut_and_edit(cut_pos-insert_pos),specificity_score,specificity_weight,distance_weight,position_weight,final_weight,cfd_before_recoding,cfd_after_recoding,cfd_after_windowScan_and_recoding,max_recut_cfd,name_of_DNA_donor,DNA donor,name_of_trimmed_DNA_Donor,trimmed_DNA_donor,effective_HA_len,synthesis_problems,cutPos2nearestOffLimitJunc,strand(gene/gRNA/donor)\n"
+            f"Entry,ID,chr,transcript_type,name,terminus,design_rank,gRNA_name,gRNA_seq,PAM,gRNA_start,gRNA_end,gRNA_cut_pos,edit_pos,distance_between_cut_and_edit(cut_pos-insert_pos),chopchop_rank,target_region_label,target_region_start,target_region_end,cfd_before_recoding,cfd_after_recoding,cfd_after_windowScan_and_recoding,max_recut_cfd,name_of_DNA_donor,DNA donor,name_of_trimmed_DNA_Donor,trimmed_DNA_donor,effective_HA_len,synthesis_problems,cutPos2nearestOffLimitJunc,strand(gene/gRNA/donor)\n"
         )   #"Entry,ID,chr,transcript_type,name,terminus,gRNA_seq,PAM,gRNA_start,gRNA_end,gRNA_cut_pos,edit_pos,distance_between_cut_and_edit(cut pos - insert pos),specificity_score,specificity_weight,distance_weight,position_weight,final_weight,cfd_before_recoding,cfd_after_recoding,cfd_after_windowScan_and_recoding,max_recut_cfd,DNA donor,effective_HA_len,synthesis_problems,cutPos2nearestOffLimitJunc,strand(gene/gRNA/donor)\n"
 
-        # open result file2 for GenoPrimer input
-        csvout_res2 = open(f"{outdir}/input_for_GenoPrimer.csv", "w")
+        # Legacy GenoPrimer export is kept in-memory for now.
+        csvout_res2 = io.StringIO()
         csvout_res2.write(f"Entry,ref,chr,coordinate,ID,geneSymbol\n")
         guides_out = open(f"{outdir}/guides_from_{guide_source}.csv", "w")
         guides_out.write(
-            "Entry,ID,terminus,rank,chr,insert_pos,seq,pam,start,end,strand,guideMITScore,guideCfdScore,guideCfdScorev2,guideCfdScorev3,Eff_scores,Cut2Ins_dist,spec_weight,dist_weight,pos_weight,final_weight\n"
+            "Entry,ID,terminus,rank,chopchop_rank,chr,insert_pos,seq,pam,start,end,strand,cut_pos,target_region_label,target_region_start,target_region_end,Eff_scores,MM0,MM1,MM2,MM3,Cut2Ins_dist\n"
         )
 
         # dataframes to store best gRNAs
@@ -947,9 +997,18 @@ def main(custom_args=None):
         total_entries = df.shape[0]
         skipped_count = 0
         for index, row in df.iterrows():
+            target_terminus = "ALL"
+            chrom = ""
+            coordinate = ""
             ENST_ID = row["Ensembl_ID"]
             if isinstance(ENST_ID, str):
                 ENST_ID =  ENST_ID.rstrip().lstrip()
+            gene_name = ""
+            if "Gene_Name" in df.columns and row.isnull().get("Gene_Name", True) == False:
+                gene_name = str(row["Gene_Name"]).rstrip().lstrip()
+            this_chopchop_cfg = dict(chopchop_config)
+            if gene_name != "":
+                this_chopchop_cfg["gene_input"] = gene_name
             if "Target_terminus" in df.columns and row.isnull()["Target_terminus"] == False:
                 target_terminus = row["Target_terminus"].rstrip().lstrip().upper()
 
@@ -1062,6 +1121,37 @@ def main(custom_args=None):
             #     continue
             log.info(f"processing {ENST_ID}\ttranscript type: {transcript_type}")
 
+            resolved_site = None
+            preferred_region = _clean_optional_str(row.get("Preferred_region", ""))
+            preferred_exon = _clean_optional_str(row.get("Preferred_exon", ""))
+            preferred_anchor = _clean_optional_str(row.get("Preferred_anchor", ""))
+            preferred_offset = _clean_optional_str(row.get("Preferred_offset", ""))
+            preferred_mode_requested = any(
+                val != "" for val in [preferred_region, preferred_exon, preferred_anchor, preferred_offset]
+            )
+            if (not coordinate_based) and preferred_mode_requested:
+                try:
+                    resolved_site = resolve_preferred_insert_site(
+                        ENST_info=ENST_info,
+                        ENST_ID=ENST_ID,
+                        preferred_region=preferred_region,
+                        preferred_exon=preferred_exon,
+                        preferred_anchor=preferred_anchor,
+                        preferred_offset=preferred_offset,
+                    )
+                except Exception as e:
+                    csvout_res.write(
+                        f"{Entry},{ENST_ID},ERROR: could not resolve Preferred_region: {str(e).replace(',', ';')}\n"
+                    )
+                    continue
+                chrom = str(resolved_site["chrom"])
+                coordinate = str(resolved_site["coordinate"])
+                coordinate_based = True
+                ENST_based = False
+                log.info(
+                    f"resolved preferred region {resolved_site['region_label']} ({resolved_site['anchor']}, offset={resolved_site['offset']}) to {chrom}:{coordinate}"
+                )
+
             if hasattr(ENST_info[ENST_ID], "name"):
                 name = ENST_info[ENST_ID].name
             else:
@@ -1127,6 +1217,10 @@ def main(custom_args=None):
                             reg_penalty=reg_penalty,
                             alphas=alphas,
                             max_abs_cut2ins=max_cut2ins_dist,
+                            specificity_backend=config["specificity_backend"],
+                            chopchop_proxy_k=config["chopchop_proxy_k"],
+                            chopchop_proxy_n=config["chopchop_proxy_n"],
+                            preserve_input_order=str(config["specificity_backend"]).lower() == "default",
                         )
                     else:
                         try:
@@ -1145,13 +1239,26 @@ def main(custom_args=None):
                                 reg_penalty=reg_penalty,
                                 alphas = alphas,
                                 guide_source=guide_source,
-                                chopchop_config=chopchop_config,
+                                chopchop_config=this_chopchop_cfg,
                             )
                         except Exception as e:
                             csvout_res.write(
                                 f"{Entry},{ENST_ID},ERROR: guide retrieval failed: {str(e).replace(',', ';')}\n"
                             )
                             continue
+                    region_label = "coordinate"
+                    region_start = None
+                    region_end = None
+                    if resolved_site is not None:
+                        region_label = resolved_site.get("region_label", region_label)
+                        region_start = resolved_site.get("region_start", None)
+                        region_end = resolved_site.get("region_end", None)
+                    ranked_df_gRNAs_target_pos = _annotate_guides_with_output_region(
+                        ranked_df_gRNAs_target_pos,
+                        region_label=region_label,
+                        region_start=region_start,
+                        region_end=region_end,
+                    )
                     write_guide_table_rows(guides_out, Entry, ENST_ID, "-", ranked_df_gRNAs_target_pos)
 
                     if ranked_df_gRNAs_target_pos.empty == True:
@@ -1235,6 +1342,11 @@ def main(custom_args=None):
                             pos_weight,
                             final_weight,
                         ) = get_res(current_gRNA, spec_score_flavor)
+                        chopchop_rank = current_gRNA["chopchop_rank"].values[0] if "chopchop_rank" in current_gRNA.columns else ""
+                        target_region_label = current_gRNA["target_region_label"].values[0] if "target_region_label" in current_gRNA.columns else ""
+                        target_region_start = current_gRNA["target_region_start"].values[0] if "target_region_start" in current_gRNA.columns else ""
+                        target_region_end = current_gRNA["target_region_end"].values[0] if "target_region_end" in current_gRNA.columns else ""
+                        cut_in_target_region = current_gRNA["cut_in_target_region"].values[0] if "cut_in_target_region" in current_gRNA.columns else ""
                         donor = HDR_template.Donor_final
                         donor_trimmed = "N/A for ssODN"
                         if config["Donor_type"] == "dsDNA":
@@ -1246,8 +1358,8 @@ def main(custom_args=None):
                         gRNA_rank_suffix = f"_rank{i+1}" if gRNA_num_out > 1 else ""
 
                         if coordinate_without_ENST:
-                            gRNA_name = f"{ENST_ID}_gRNA_entry{Entry}{gRNA_rank_suffix}"
-                            donor_name = f"{ENST_ID}_donor_entry{Entry}{gRNA_rank_suffix}"
+                            gRNA_name = f"{ENST_ID}_coord_gRNA_entry{Entry}{gRNA_rank_suffix}"
+                            donor_name = f"{ENST_ID}_coord_donor_entry{Entry}{gRNA_rank_suffix}"
                         else:
                             chrom_coord = f"{chrom}_{coordinate}"
                             ENST_design_counts[chrom_coord] = ENST_design_counts.get(chrom_coord, 0) + 1
@@ -1267,7 +1379,7 @@ def main(custom_args=None):
                         insert_pos = HDR_template.InsPos
                         if config["recoding_off"]:
                             csvout_res.write(
-                                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                             )
                             csvout_res2.write( f"{Entry},"+
                                 config["genome_ver"]
@@ -1277,7 +1389,7 @@ def main(custom_args=None):
                             if not isinstance(cfd4, float):
                                 cfd4 = ""
                             csvout_res.write(
-                                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                             )
                             csvout_res2.write( f"{Entry},"+
                                 config["genome_ver"]
@@ -1286,6 +1398,7 @@ def main(custom_args=None):
 
                         # donor features
                         donor_features = HDR_template.Donor_features
+                        write_ha_csv_row(ha_out, Entry, ENST_ID, "-", i+1, gRNA_name, seq, insert_pos, HDR_template)
                         # write genbank file
                         with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                             write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1349,6 +1462,10 @@ def main(custom_args=None):
                         reg_penalty=reg_penalty,
                         alphas=alphas,
                         max_abs_cut2ins=max_cut2ins_dist,
+                        specificity_backend=config["specificity_backend"],
+                        chopchop_proxy_k=config["chopchop_proxy_k"],
+                        chopchop_proxy_n=config["chopchop_proxy_n"],
+                        preserve_input_order=str(config["specificity_backend"]).lower() == "default",
                     )
                     ranked_df_gRNAs_stop = pd.DataFrame()
                 else:
@@ -1366,7 +1483,7 @@ def main(custom_args=None):
                             reg_penalty=reg_penalty,
                             alphas = alphas,
                             guide_source=guide_source,
-                            chopchop_config=chopchop_config,
+                            chopchop_config=this_chopchop_cfg,
                         )
                     except Exception as e:
                         csvout_res.write(
@@ -1473,8 +1590,8 @@ def main(custom_args=None):
                     gRNA_rank_suffix = f"_rank{i+1}" if gRNA_num_out > 1 else ""
 
                     ENST_design_counts[ENST_ID] = ENST_design_counts.get(ENST_ID, 0) + 1
-                    gRNA_name = f"{ENST_ID}_gRNA_entry{Entry}{gRNA_rank_suffix}"
-                    donor_name = f"{ENST_ID}_donor_entry{Entry}{gRNA_rank_suffix}"
+                    gRNA_name = f"{ENST_ID}_N_gRNA_entry{Entry}{gRNA_rank_suffix}"
+                    donor_name = f"{ENST_ID}_N_donor_entry{Entry}{gRNA_rank_suffix}"
                     if config["Donor_type"] == "dsDNA":
                         donor_trimmed_name = donor_name.replace("donor_", "donor_trimmed_")
                         #donor_trimmed_name = f"{ENST_ID}_donor_trimmed_{ENST_design_counts[ENST_ID]}"
@@ -1490,7 +1607,7 @@ def main(custom_args=None):
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
                         csvout_res.write(
-                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -1503,7 +1620,7 @@ def main(custom_args=None):
                         if not isinstance(cfd4, float):
                             cfd4 = ""
                         csvout_res.write(
-                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -1512,6 +1629,7 @@ def main(custom_args=None):
 
                     # donor features
                     donor_features = HDR_template.Donor_features
+                    write_ha_csv_row(ha_out, Entry, ENST_ID, "N", i+1, gRNA_name, seq, insert_pos, HDR_template)
                     # write genbank file
                     with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                         write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1576,6 +1694,10 @@ def main(custom_args=None):
                         reg_penalty=reg_penalty,
                         alphas=alphas,
                         max_abs_cut2ins=max_cut2ins_dist,
+                        specificity_backend=config["specificity_backend"],
+                        chopchop_proxy_k=config["chopchop_proxy_k"],
+                        chopchop_proxy_n=config["chopchop_proxy_n"],
+                        preserve_input_order=str(config["specificity_backend"]).lower() == "default",
                     )
                 else:
                     try:
@@ -1592,7 +1714,7 @@ def main(custom_args=None):
                             reg_penalty=reg_penalty,
                             alphas = alphas,
                             guide_source=guide_source,
-                            chopchop_config=chopchop_config,
+                            chopchop_config=this_chopchop_cfg,
                         )
                     except Exception as e:
                         csvout_res.write(
@@ -1699,8 +1821,8 @@ def main(custom_args=None):
                     gRNA_rank_suffix = f"_rank{i+1}" if gRNA_num_out > 1 else ""
 
                     ENST_design_counts[ENST_ID] = ENST_design_counts.get(ENST_ID, 0) + 1
-                    gRNA_name = f"{ENST_ID}_gRNA_entry{Entry}{gRNA_rank_suffix}"
-                    donor_name = f"{ENST_ID}_donor_entry{Entry}{gRNA_rank_suffix}"
+                    gRNA_name = f"{ENST_ID}_C_gRNA_entry{Entry}{gRNA_rank_suffix}"
+                    donor_name = f"{ENST_ID}_C_donor_entry{Entry}{gRNA_rank_suffix}"
                     if config["Donor_type"] == "dsDNA":
                         donor_trimmed_name = donor_name.replace("donor_", "donor_trimmed_")
                         #donor_trimmed_name = f"{ENST_ID}_donor_trimmed_{ENST_design_counts[ENST_ID]}"
@@ -1716,7 +1838,7 @@ def main(custom_args=None):
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
                         csvout_res.write(
-                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                         )
                         csvout_res2.write( f"{Entry},"+
                             config["genome_ver"]
@@ -1729,7 +1851,7 @@ def main(custom_args=None):
                         if not isinstance(cfd4, float):
                             cfd4 = ""
                         csvout_res.write(
-                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{spec_score},{ret_six_dec(spec_weight)},{ret_six_dec(dist_weight)},{ret_six_dec(pos_weight)},{ret_six_dec(final_weight)},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{pam},{s},{e},{gRNA_cut_pos},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -1738,6 +1860,7 @@ def main(custom_args=None):
 
                     # donor features
                     donor_features = HDR_template.Donor_features
+                    write_ha_csv_row(ha_out, Entry, ENST_ID, "C", i+1, gRNA_name, seq, insert_pos, HDR_template)
                     # write genbank file
                     with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                         write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1802,6 +1925,7 @@ def main(custom_args=None):
         csvout_res.close()
         csvout_res2.close()
         guides_out.close()
+        ha_out.close()
 
     except Exception as e:
         print("Unexpected error:", str(sys.exc_info()))
@@ -1829,25 +1953,37 @@ def _valid_coord_pair(v):
     except Exception:
         return False
 
+
+def _genbank_record_names(donor_name):
+    record_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(donor_name)).strip("._")
+    if record_id == "":
+        record_id = "protoSpaceJAM_donor"
+
+    locus = record_id
+    if len(locus) > 16:
+        locus = locus.replace("ENST", "")
+        locus = locus.lstrip("0")
+        locus = locus.replace("donor", "")
+        locus = locus.replace("donor_trimmed", "")
+        locus = locus.replace("entry", "")
+        locus = locus.replace("__", "_")
+        if len(locus) > 16:
+            locus = locus[:16]
+    if locus == "":
+        locus = record_id[:16] if len(record_id) > 16 else record_id
+    return locus, record_id
+
 def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
     """write genebank file"""
-    if len(donor_name) > 16: # truncate donor_name to 16 characters (GenBank limit for locus name)
-        donor_name = donor_name.replace("ENST", "")
-        donor_name = donor_name.lstrip("0")
-        donor_name = donor_name.replace("donor", "")
-        donor_name = donor_name.replace("donor_trimmed", "")
-        donor_name = donor_name.replace("entry", "")
-        donor_name = donor_name.replace("__", "_")
-        if len(donor_name) > 16:
-            donor_name = donor_name[:16]
+    donor_locus, donor_record_id = _genbank_record_names(donor_name)
 
     gb_record = Record.Record()
-    gb_record.locus = donor_name
+    gb_record.locus = donor_locus
     gb_record.size = len(data_obj.Donor_final)
     gb_record.residue_type = 'DNA'
     gb_record.data_file_division = 'PLN'
     gb_record.definition = ''
-    gb_record.accession = ['']
+    gb_record.accession = [donor_record_id]
     gb_record.version = ''
     gb_record.keywords = ['DNA donor']
     gb_record.source = "synthetic DNA donor"
@@ -1857,11 +1993,12 @@ def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
 
     # Convert the Bio.GenBank record to a SeqRecord (needed for writing with SeqIO)
     sequence = Seq(gb_record.sequence)
-    seq_record = SeqRecord(sequence, id=gb_record.accession[0], name=donor_name, description= f"DNA donor type: {donor_type}")
+    seq_record = SeqRecord(sequence, id=donor_record_id, name=donor_locus, description= f"DNA donor type: {donor_type}")
     seq_record.annotations["date"] = get_current_date_formatted()
     seq_record.annotations["data_file_division"] = gb_record.data_file_division
     seq_record.annotations["organism"] = 'synthetic DNA donor'
     seq_record.annotations["molecule_type"] = "DNA"
+    seq_record.annotations["accessions"] = [donor_record_id]
 
     donor_features = getattr(data_obj, "Donor_features", None)
     if not isinstance(donor_features, dict):
@@ -1869,54 +2006,35 @@ def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
 
     # Features
     if _valid_coord_pair(donor_features.get("left_arm_coord")) and ("HA_payload_strand" in donor_features):
-        feature = SeqFeature(FeatureLocation(start=donor_features["left_arm_coord"][0], end=donor_features["left_arm_coord"][1], strand=donor_features["HA_payload_strand"]), type='left HA', qualifiers={"label": "left HA"})
+        feature = SeqFeature(FeatureLocation(start=donor_features["left_arm_coord"][0], end=donor_features["left_arm_coord"][1], strand=donor_features["HA_payload_strand"]), type='misc_feature', qualifiers={"label": "left HA"})
         seq_record.features.append(feature)
 
     if _valid_coord_pair(donor_features.get("right_arm_coord")) and ("HA_payload_strand" in donor_features):
-        feature = SeqFeature(FeatureLocation(start=donor_features["right_arm_coord"][0], end=donor_features["right_arm_coord"][1], strand=donor_features["HA_payload_strand"]), type='right HA', qualifiers={"label": "right HA"})
+        feature = SeqFeature(FeatureLocation(start=donor_features["right_arm_coord"][0], end=donor_features["right_arm_coord"][1], strand=donor_features["HA_payload_strand"]), type='misc_feature', qualifiers={"label": "right HA"})
         seq_record.features.append(feature)
 
     if _valid_coord_pair(donor_features.get("tag_coord")) and ("HA_payload_strand" in donor_features):
-        feature = SeqFeature(FeatureLocation(start=donor_features["tag_coord"][0], end=donor_features["tag_coord"][1], strand=donor_features["HA_payload_strand"]), type='payload', qualifiers={"label": "payload"})
+        feature = SeqFeature(FeatureLocation(start=donor_features["tag_coord"][0], end=donor_features["tag_coord"][1], strand=donor_features["HA_payload_strand"]), type='misc_feature', qualifiers={"label": "payload"})
         seq_record.features.append(feature)
-        payload_sequence = sequence[donor_features["tag_coord"][0]:donor_features["tag_coord"][1]]
-        # translate the payload
-        if payload_type == "insertion":
-            payload_aa_seq = translate_sequence(str(payload_sequence))
-            feature = SeqFeature(FeatureLocation(start=donor_features["tag_coord"][0], end=donor_features["tag_coord"][1], strand=donor_features["HA_payload_strand"]), type='CDS', qualifiers={"label": "CDS", "codon_start":1, "translation": payload_aa_seq})
-            seq_record.features.append(feature)
 
     if "coding_coord" in donor_features and "HA_payload_strand" in donor_features:
         for feat in donor_features["coding_coord"]:
             if not _valid_coord_pair(feat):
                 continue
-            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=donor_features["HA_payload_strand"], type='exon ', qualifiers={"label": "exon"})
+            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=donor_features["HA_payload_strand"], type='exon', qualifiers={"label": "exon"})
             seq_record.features.append(feature)
-
-    if "ORF_coord" in donor_features and "HA_payload_strand" in donor_features:
-        for feat in donor_features["ORF_coord"]:
-            if not _valid_coord_pair(feat):
-                continue
-            #feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=data_obj.Donor_features["HA_payload_strand"], type='CDS-in-frame', qualifiers={"label": "CDS-in-frame"})
-            #seq_record.features.append(feature)
-
-            # Extract and translate the coding in-frame sequence
-            orf_sequence = sequence[feat[0]:feat[1]]
-            protein_sequence = translate_sequence(str(orf_sequence))
-            protein_feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=donor_features["HA_payload_strand"],type='CDS', qualifiers={"label": "CDS", "codon_start": 1, "translation": protein_sequence})
-            seq_record.features.append(protein_feature)
 
     if "gRNA_coord" in donor_features and "gRNA_strand" in donor_features:
         for feat in donor_features["gRNA_coord"]:
             if not _valid_coord_pair(feat):
                 continue
-            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1], strand=donor_features["gRNA_strand"]), type='gRNA+PAM', qualifiers={"label": "gRNA+PAM"})
+            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1], strand=donor_features["gRNA_strand"]), type='misc_feature', qualifiers={"label": "gRNA+PAM"})
             seq_record.features.append(feature)
     if "recoding_coord" in donor_features:
         for feat in donor_features["recoding_coord"]:
             if not _valid_coord_pair(feat):
                 continue
-            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), type='recode', qualifiers={"label": "recode"})
+            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), type='misc_feature', qualifiers={"label": "recode"})
             seq_record.features.append(feature)
 
     # Write to a GenBank file using SeqIO for the actual file writing
@@ -1924,23 +2042,15 @@ def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
 
 def write_genbank_gRNAonly_noPayload(handle, data_obj, donor_name, donor_type, payload_type):
     """write genebank file with wt homology arm and gRNA only"""
-    if len(donor_name) > 16: # truncate donor_name to 16 characters (GenBank limit for locus name)
-        donor_name = donor_name.replace("ENST", "")
-        donor_name = donor_name.lstrip("0")
-        donor_name = donor_name.replace("donor", "")
-        donor_name = donor_name.replace("donor_trimmed", "")
-        donor_name = donor_name.replace("entry", "")
-        donor_name = donor_name.replace("__", "_")
-        if len(donor_name) > 16:
-            donor_name = donor_name[:16]
+    donor_locus, donor_record_id = _genbank_record_names(donor_name)
 
     gb_record = Record.Record()
-    gb_record.locus = donor_name
+    gb_record.locus = donor_locus
     gb_record.size = len(data_obj.left_flk_seq + data_obj.right_flk_seq)
     gb_record.residue_type = 'DNA'
     gb_record.data_file_division = 'PLN'
     gb_record.definition = ''
-    gb_record.accession = ['']
+    gb_record.accession = [donor_record_id]
     gb_record.version = ''
     gb_record.keywords = ['DNA sequence']
     gb_record.source = "DNA sequence"
@@ -1950,11 +2060,12 @@ def write_genbank_gRNAonly_noPayload(handle, data_obj, donor_name, donor_type, p
 
     # Convert the Bio.GenBank record to a SeqRecord (needed for writing with SeqIO)
     sequence = Seq(gb_record.sequence)
-    seq_record = SeqRecord(sequence, id=gb_record.accession[0], name=donor_name, description= f"wt homology arms and gRNA")
+    seq_record = SeqRecord(sequence, id=donor_record_id, name=donor_locus, description= f"wt homology arms and gRNA")
     seq_record.annotations["date"] = get_current_date_formatted()
     seq_record.annotations["data_file_division"] = gb_record.data_file_division
     seq_record.annotations["organism"] = 'DNA sequence'
     seq_record.annotations["molecule_type"] = "DNA"
+    seq_record.annotations["accessions"] = [donor_record_id]
 
     payloadless_features = getattr(data_obj, "payloadless_donor_features", None)
     if not isinstance(payloadless_features, dict):
@@ -1962,18 +2073,18 @@ def write_genbank_gRNAonly_noPayload(handle, data_obj, donor_name, donor_type, p
 
     # Features
     if _valid_coord_pair(payloadless_features.get("left_arm_coord")) and ("HA_payload_strand" in payloadless_features):
-        feature = SeqFeature(FeatureLocation(start=payloadless_features["left_arm_coord"][0], end=payloadless_features["left_arm_coord"][1], strand=payloadless_features["HA_payload_strand"]), type='left HA', qualifiers={"label": "left homology arm (before trimming)"})
+        feature = SeqFeature(FeatureLocation(start=payloadless_features["left_arm_coord"][0], end=payloadless_features["left_arm_coord"][1], strand=payloadless_features["HA_payload_strand"]), type='misc_feature', qualifiers={"label": "left homology arm (before trimming)"})
         seq_record.features.append(feature)
 
     if _valid_coord_pair(payloadless_features.get("right_arm_coord")) and ("HA_payload_strand" in payloadless_features):
-        feature = SeqFeature(FeatureLocation(start=payloadless_features["right_arm_coord"][0], end=payloadless_features["right_arm_coord"][1], strand=payloadless_features["HA_payload_strand"]), type='right HA', qualifiers={"label": "right homology arm (before trimming)"})
+        feature = SeqFeature(FeatureLocation(start=payloadless_features["right_arm_coord"][0], end=payloadless_features["right_arm_coord"][1], strand=payloadless_features["HA_payload_strand"]), type='misc_feature', qualifiers={"label": "right homology arm (before trimming)"})
         seq_record.features.append(feature)
 
     if "coding_coord" in payloadless_features and "HA_payload_strand" in payloadless_features:
         for feat in payloadless_features["coding_coord"]:
             if not _valid_coord_pair(feat):
                 continue
-            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=payloadless_features["HA_payload_strand"], type='exon ', qualifiers={"label": "exon"})
+            feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=payloadless_features["HA_payload_strand"], type='exon', qualifiers={"label": "exon"})
             seq_record.features.append(feature)
 
     if "ORF_coord" in payloadless_features and "HA_payload_strand" in payloadless_features:
@@ -2117,6 +2228,36 @@ def resolve_payload_inputs_from_files(config):
             config[seq_key] = load_sequence_from_file(fpath)
 
 
+def validate_payload_inputs(config, log):
+    payload_type = str(config.get("payload_type", "insertion")).strip().lower()
+    if payload_type != "insertion":
+        return
+
+    payload_specs = [
+        ("payload", "global payload"),
+        ("Npayload", "N-terminus payload"),
+        ("Cpayload", "C-terminus payload"),
+        ("POSpayload", "coordinate payload"),
+    ]
+    for key, label in payload_specs:
+        seq = str(config.get(key, "") or "").strip().upper()
+        if seq == "":
+            continue
+        clean = re.sub(r"[^ACGTN]", "", seq)
+        if clean == "":
+            log.warning(f"{label} is empty after removing non-ACGTN characters")
+            continue
+        if clean != seq:
+            log.warning(
+                f"{label} contains non-ACGTN characters; frame check uses sanitized length {len(clean)} bp"
+            )
+        mod = len(clean) % 3
+        if mod == 0:
+            log.info(f"{label}: {len(clean)} bp (in-frame, length mod 3 = 0)")
+        else:
+            log.warning(f"{label}: {len(clean)} bp (out-of-frame, length mod 3 = {mod})")
+
+
 def load_input_dataframe(config, outdir, log):
     """Load target table from CSV or build one-row table from direct CLI args."""
     if str(config["input_mode"]).lower() == "direct":
@@ -2206,6 +2347,7 @@ def load_guides_dataframe(config, log):
         "guideCfdScorev2": 50,
         "guideCfdScorev3": 50,
         "Eff_scores": 0,
+        "chopchop_offtarget_penalty": float("nan"),
         "chr": "",
         "ID": "",
         "Insert_pos": 0,
@@ -2214,6 +2356,7 @@ def load_guides_dataframe(config, log):
         "dist_weight": 1,
         "pos_weight": 1,
         "final_weight": 1,
+        "score_note": "",
     }
     for col, value in defaults.items():
         if col not in df.columns:
@@ -2295,6 +2438,14 @@ def _get_cache_path(cache_dir, genome_ver, enst_id):
     return os.path.join(cache_dir, f"{safe_genome}_{safe_enst}.annotation.json")
 
 
+def _get_regions_cache_path(cache_dir, genome_ver, enst_id):
+    if not cache_dir:
+        return ""
+    safe_enst = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(enst_id))
+    safe_genome = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(genome_ver))
+    return os.path.join(cache_dir, f"{safe_genome}_{safe_enst}.regions.json")
+
+
 def _build_transcript_obj_from_bundle_data(data):
     enst_id = data["enst_id"]
     chr_name = str(data["chr"])
@@ -2332,6 +2483,111 @@ def _build_transcript_obj_from_bundle_data(data):
         features=features,
     )
     return {enst_id: transcript_obj}
+
+
+def _region_record(label, intervals, strand, region_type="", exon_number=None):
+    normalized = [_normalize_interval(s, e) for s, e in intervals]
+    if len(normalized) == 0:
+        return None
+    positions = _positions_from_intervals(normalized, strand)
+    return {
+        "label": str(label),
+        "region_type": str(region_type) if region_type else str(label),
+        "exon_number": int(exon_number) if exon_number is not None else None,
+        "intervals": [[int(s), int(e)] for s, e in normalized],
+        "start": int(min(positions)),
+        "end": int(max(positions)),
+        "transcript_anchor_start": int(positions[0]),
+        "transcript_anchor_end": int(positions[-1]),
+    }
+
+
+def _build_region_catalog(chr_name, strand, exons, cds, utr5, utr3):
+    strand = int(strand)
+    exon_order = _intervals_in_transcript_order(exons, strand)
+    regions = []
+
+    def add_region(label, intervals, region_type="", exon_number=None):
+        record = _region_record(
+            label=label,
+            intervals=intervals,
+            strand=strand,
+            region_type=region_type,
+            exon_number=exon_number,
+        )
+        if record is not None:
+            regions.append(record)
+
+    add_region("transcript", exons, "transcript")
+    add_region("CDS", cds, "CDS")
+    add_region("5UTR", utr5, "5UTR")
+    add_region("3UTR", utr3, "3UTR")
+
+    for exon_num, exon_interval in enumerate(exon_order, start=1):
+        add_region(f"exon{exon_num}", [exon_interval], "exon", exon_num)
+        overlaps = []
+        for cds_start, cds_end in cds:
+            ov_start = max(int(exon_interval[0]), int(cds_start))
+            ov_end = min(int(exon_interval[1]), int(cds_end))
+            if ov_start <= ov_end:
+                overlaps.append([ov_start, ov_end])
+        if len(overlaps) > 0:
+            add_region(f"CDS_exon{exon_num}", overlaps, "CDS", exon_num)
+
+    return {
+        "chr": str(chr_name),
+        "strand": strand,
+        "regions": regions,
+    }
+
+
+def _build_region_catalog_from_bundle_data(bundle_data):
+    return _build_region_catalog(
+        chr_name=bundle_data.get("chr", ""),
+        strand=bundle_data.get("strand", 1),
+        exons=bundle_data.get("exons", []),
+        cds=bundle_data.get("cds", []),
+        utr5=bundle_data.get("utr5", []),
+        utr3=bundle_data.get("utr3", []),
+    )
+
+
+def _build_region_catalog_from_transcript_obj(transcript_obj):
+    strand = int(getattr(transcript_obj.features[0], "strand", 1))
+    exons = _transcript_feature_intervals(transcript_obj, "exon")
+    cds = _transcript_feature_intervals(transcript_obj, "CDS")
+    utr5, utr3 = _derive_utr_from_exons_and_cds(exons=exons, cds=cds, strand=strand)
+    return _build_region_catalog(
+        chr_name=str(getattr(transcript_obj, "chr", "")),
+        strand=strand,
+        exons=exons,
+        cds=cds,
+        utr5=utr5,
+        utr3=utr3,
+    )
+
+
+def _get_region_entry_from_catalog(region_catalog, region="", exon_num=None):
+    requested = _normalize_preferred_region(region)
+    if requested == "":
+        requested = "CDS"
+    if requested == "exon":
+        if exon_num is None or exon_num <= 0:
+            raise ValueError("Preferred_exon is required and must be >= 1 when Preferred_region=exon")
+        target_label = f"exon{int(exon_num)}"
+    elif requested == "CDS":
+        target_label = f"CDS_exon{int(exon_num)}" if exon_num is not None else "CDS"
+    elif requested in ["5UTR", "3UTR", "transcript"]:
+        target_label = requested
+    else:
+        target_label = "transcript"
+
+    for region_entry in region_catalog.get("regions", []):
+        if str(region_entry.get("label", "")) == target_label:
+            return region_entry
+    if requested == "CDS" and exon_num is not None:
+        raise ValueError("Preferred_exon=%s has no CDS segment in this transcript" % exon_num)
+    raise ValueError("Requested region '%s' is unavailable for this transcript" % target_label)
 
 
 def _build_loc2postype_for_transcript(enst_id, chr_name, strand, exons, cds, utr5, utr3):
@@ -2537,6 +2793,25 @@ def get_ensembl_annotation_bundle(enst_id, genome_ver, cache=None, cache_dir="",
             except Exception:
                 pass
 
+    region_catalog = _build_region_catalog_from_bundle_data(bundle_data)
+    regions_cache_path = _get_regions_cache_path(cache_dir, genome_ver, enst_id)
+    if regions_cache_path:
+        try:
+            mkdir(os.path.dirname(regions_cache_path))
+            region_payload = {
+                "enst_id": str(bundle_data.get("enst_id", enst_id)),
+                "gene_name": str(bundle_data.get("gene_name", enst_id)),
+                "chr": str(bundle_data.get("chr", "")),
+                "strand": int(bundle_data.get("strand", 1)),
+                "span_start": int(bundle_data.get("span_start", 0)),
+                "span_end": int(bundle_data.get("span_end", 0)),
+                "regions": region_catalog.get("regions", []),
+            }
+            with open(regions_cache_path, "w", encoding="utf-8") as fh:
+                json.dump(region_payload, fh, indent=2)
+        except Exception:
+            pass
+
     transcript_dict = _build_transcript_obj_from_bundle_data(bundle_data)
     enst_key = str(bundle_data["enst_id"])
     chr_name = str(bundle_data["chr"])
@@ -2565,6 +2840,7 @@ def get_ensembl_annotation_bundle(enst_id, genome_ver, cache=None, cache_dir="",
         "ENST_info": transcript_dict,
         "loc2posType": loc2posType,
         "ENST_PhaseInCodon": phase_map,
+        "region_catalog": region_catalog,
     }
     if cache is not None:
         cache[enst_id] = out
@@ -2591,6 +2867,197 @@ def get_insert_positions_from_ensembl_bundle(genome_ver, enst_id, cache=None, ca
         return (n_insert, c_insert, chr_name)
     except Exception:
         return None
+
+
+def _clean_optional_str(value):
+    if value is None:
+        return ""
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _normalize_preferred_region(value):
+    raw = _clean_optional_str(value)
+    if raw == "":
+        return ""
+    compact = re.sub(r"[^a-z0-9]+", "", raw.lower())
+    region_map = {
+        "exon": "exon",
+        "5utr": "5UTR",
+        "utr5": "5UTR",
+        "fiveutr": "5UTR",
+        "fiveprimeutr": "5UTR",
+        "5primeutr": "5UTR",
+        "3utr": "3UTR",
+        "utr3": "3UTR",
+        "threeutr": "3UTR",
+        "threeprimeutr": "3UTR",
+        "3primeutr": "3UTR",
+        "cds": "CDS",
+        "coding": "CDS",
+        "codingsequence": "CDS",
+        "transcript": "transcript",
+        "mrna": "transcript",
+    }
+    return region_map.get(compact, "")
+
+
+def _normalize_preferred_anchor(value):
+    raw = _clean_optional_str(value)
+    if raw == "":
+        return "center"
+    compact = re.sub(r"[^a-z0-9]+", "", raw.lower())
+    anchor_map = {
+        "start": "start",
+        "5prime": "start",
+        "5p": "start",
+        "beginning": "start",
+        "end": "end",
+        "3prime": "end",
+        "3p": "end",
+        "stop": "end",
+        "center": "center",
+        "centre": "center",
+        "middle": "center",
+        "mid": "center",
+    }
+    return anchor_map.get(compact, "center")
+
+
+def _parse_optional_int(value, field_name):
+    text = _clean_optional_str(value)
+    if text == "":
+        return None
+    try:
+        return int(text)
+    except Exception:
+        raise ValueError("%s must be an integer if provided" % field_name)
+
+
+def _intervals_in_transcript_order(intervals, strand):
+    normalized = [_normalize_interval(s, e) for s, e in intervals]
+    if int(strand) == 1:
+        return sorted(normalized, key=lambda x: x[0])
+    return sorted(normalized, key=lambda x: x[0], reverse=True)
+
+
+def _positions_from_intervals(intervals, strand):
+    ordered = _intervals_in_transcript_order(intervals, strand)
+    positions = []
+    for start, end in ordered:
+        if int(strand) == 1:
+            positions.extend(range(int(start), int(end) + 1))
+        else:
+            positions.extend(range(int(end), int(start) - 1, -1))
+    return positions
+
+
+def _transcript_feature_intervals(transcript_obj, feature_type):
+    wanted = str(feature_type).lower()
+    intervals = []
+    for feat in getattr(transcript_obj, "features", []):
+        feat_type = str(getattr(feat, "type", "")).lower()
+        if feat_type != wanted:
+            continue
+        location = getattr(feat, "location", None)
+        if location is None:
+            continue
+        start = getattr(location, "start", None)
+        end = getattr(location, "end", None)
+        if start is None or end is None:
+            continue
+        intervals.append([int(start), int(end)])
+    return intervals
+
+
+def _resolve_anchor_coordinate_from_positions(positions, anchor="center", offset=0):
+    if len(positions) == 0:
+        raise ValueError("No genomic positions available for the requested region")
+    anchor = _normalize_preferred_anchor(anchor)
+    if anchor == "start":
+        idx = 0
+    elif anchor == "end":
+        idx = len(positions) - 1
+    else:
+        idx = (len(positions) - 1) // 2
+    idx = idx + int(offset)
+    idx = max(0, min(len(positions) - 1, idx))
+    return int(positions[idx])
+
+
+def resolve_preferred_insert_site(ENST_info, ENST_ID, preferred_region="", preferred_exon="", preferred_anchor="", preferred_offset=""):
+    region = _normalize_preferred_region(preferred_region)
+    if region == "":
+        region = "CDS"
+    if ENST_ID not in ENST_info:
+        raise ValueError("Transcript annotation is unavailable for %s" % ENST_ID)
+
+    transcript_obj = ENST_info[ENST_ID]
+    strand = int(getattr(transcript_obj.features[0], "strand", 1))
+    chr_name = str(getattr(transcript_obj, "chr", ""))
+    anchor = _normalize_preferred_anchor(preferred_anchor)
+    offset = _parse_optional_int(preferred_offset, "Preferred_offset") or 0
+    exon_num = _parse_optional_int(preferred_exon, "Preferred_exon")
+
+    region_catalog = _build_region_catalog_from_transcript_obj(transcript_obj)
+    region_entry = _get_region_entry_from_catalog(
+        region_catalog=region_catalog,
+        region=region,
+        exon_num=exon_num,
+    )
+
+    positions = _positions_from_intervals(region_entry.get("intervals", []), strand)
+    coordinate = _resolve_anchor_coordinate_from_positions(
+        positions=positions,
+        anchor=anchor,
+        offset=offset,
+    )
+    return {
+        "chrom": chr_name,
+        "coordinate": coordinate,
+        "region_label": str(region_entry.get("label", region)),
+        "region_start": int(region_entry.get("start")),
+        "region_end": int(region_entry.get("end")),
+        "anchor": anchor,
+        "offset": offset,
+    }
+
+
+def _extract_donor_feature_seq(donor_seq, coord_pair):
+    if donor_seq is None or not _valid_coord_pair(coord_pair):
+        return ""
+    seq_len = len(donor_seq)
+    start = max(0, int(coord_pair[0]))
+    end = min(seq_len, int(coord_pair[1]))
+    if end <= start and end < seq_len:
+        end = min(seq_len, end + 1)
+    if end <= start:
+        return ""
+    return str(donor_seq[start:end])
+
+
+def write_ha_csv_row(handle, entry, enst_id, terminus, design_rank, gRNA_name, gRNA_seq, insert_pos, hdr_template):
+    donor_seq = str(getattr(hdr_template, "Donor_final", "") or "")
+    donor_features = getattr(hdr_template, "Donor_features", {}) or {}
+    left_ha = _extract_donor_feature_seq(donor_seq, donor_features.get("left_arm_coord"))
+    right_ha = _extract_donor_feature_seq(donor_seq, donor_features.get("right_arm_coord"))
+    payload_seq = _extract_donor_feature_seq(donor_seq, donor_features.get("tag_coord"))
+    handle.write(
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+            entry,
+            enst_id,
+            terminus,
+            design_rank,
+            gRNA_name,
+            gRNA_seq,
+            insert_pos,
+            left_ha,
+            payload_seq,
+            right_ha,
+            donor_seq,
+        )
+    )
 
 
 def get_insert_positions_from_local_enst(genome_ver, enst_id, cache=None):
@@ -2652,6 +3119,24 @@ def _cut_pos_from_start_and_strand(start, strand):
     if st in ["+", "1", "1.0"]:
         return s + 16
     return s - 17
+
+
+def _annotate_guides_with_output_region(guides_df, region_label="", region_start=None, region_end=None):
+    if guides_df is None or guides_df.empty:
+        return guides_df
+    out = guides_df.copy()
+    out["target_region_label"] = str(region_label) if region_label is not None else ""
+    out["target_region_start"] = region_start if region_start is not None else ""
+    out["target_region_end"] = region_end if region_end is not None else ""
+    out["cut_pos"] = out.apply(lambda r: _cut_pos_from_start_and_strand(r.get("start", 0), r.get("strand", "+")), axis=1)
+    if region_start is not None and region_end is not None:
+        lo = min(int(region_start), int(region_end))
+        hi = max(int(region_start), int(region_end))
+        cut_series = pd.to_numeric(out["cut_pos"], errors="coerce")
+        out["cut_in_target_region"] = cut_series.notna() & (cut_series >= lo) & (cut_series <= hi)
+    else:
+        out["cut_in_target_region"] = ""
+    return out
 
 
 def _safe_float(v, default=0.0):
@@ -2738,10 +3223,39 @@ def rerank_guides_csv_with_psj(
     reg_penalty,
     alphas,
     max_abs_cut2ins=None,
+    specificity_backend="default",
+    chopchop_proxy_k=600.0,
+    chopchop_proxy_n=1.0,
+    preserve_input_order=False,
 ):
     if guides_df is None or guides_df.empty:
         return guides_df
     out = guides_df.copy().reset_index(drop=True)
+    # Preserve raw CHOPCHOP ranking by default; keep PSJ reranking logic available behind non-default backends.
+    if preserve_input_order and str(specificity_backend).lower() == "default":
+        cut2ins = []
+        for _, row in out.iterrows():
+            cut_pos = _cut_pos_from_start_and_strand(row.get("start", 0), row.get("strand", "+"))
+            if cut_pos is None:
+                this_dist = 10**9
+            else:
+                this_dist = int(cut_pos) - int(insert_pos)
+                if terminus_type == "start" and int(enst_strand) == -1:
+                    this_dist += 1
+                if terminus_type == "stop" and int(enst_strand) == 1:
+                    this_dist += 1
+            cut2ins.append(this_dist)
+        out["chr"] = str(chrom)
+        out["ID"] = str(enst_id)
+        out["Insert_pos"] = int(insert_pos)
+        out["Cut2Ins_dist"] = cut2ins
+        out["spec_weight"] = float("nan")
+        out["dist_weight"] = float("nan")
+        out["pos_weight"] = float("nan")
+        out["final_weight"] = float("nan")
+        if max_abs_cut2ins is not None:
+            out = out[pd.to_numeric(out["Cut2Ins_dist"], errors="coerce").abs() <= float(max_abs_cut2ins)]
+        return out.reset_index(drop=True)
     spec_w = []
     dist_w = []
     pos_w = []
@@ -2759,8 +3273,15 @@ def rerank_guides_csv_with_psj(
                 this_dist += 1
         cut2ins.append(this_dist)
 
-        sscore = _safe_float(row.get(spec_score_flavor, row.get("guideMITScore", 50.0)), 50.0)
-        sw = _psj_specificity_weight(sscore)
+        if str(specificity_backend).lower() == "chopchop_proxy":
+            penalty = _safe_float(row.get("chopchop_offtarget_penalty", float("nan")), float("nan"))
+            if pd.isna(penalty):
+                sw = 1.0
+            else:
+                sw = 1.0 / (1.0 + (float(penalty) / float(chopchop_proxy_k)) ** float(chopchop_proxy_n))
+        else:
+            sscore = _safe_float(row.get(spec_score_flavor, row.get("guideMITScore", 50.0)), 50.0)
+            sw = _psj_specificity_weight(sscore)
         dw = _psj_dist_weight(this_dist)
         if reg_penalty:
             types_here = _get_loc2pos_types(chrom, enst_id, cut_pos, loc2posType) if cut_pos is not None else []
@@ -2789,7 +3310,10 @@ def rerank_guides_csv_with_psj(
     if max_abs_cut2ins is not None:
         out = out[pd.to_numeric(out["Cut2Ins_dist"], errors="coerce").abs() <= float(max_abs_cut2ins)]
 
-    out = out.sort_values(["final_weight"], ascending=False, kind="stable").reset_index(drop=True)
+    if preserve_input_order:
+        out = out.reset_index(drop=True)
+    else:
+        out = out.sort_values(["final_weight"], ascending=False, kind="stable").reset_index(drop=True)
     return out
 
 
@@ -2866,12 +3390,7 @@ def select_guides_from_csv(
         tmp["_abs_cut2ins"] = pd.to_numeric(tmp["Cut2Ins_dist"], errors="coerce").abs()
         tmp = tmp[tmp["_abs_cut2ins"].notna()]
         tmp = tmp[tmp["_abs_cut2ins"] <= float(max_abs_cut2ins)]
-        if not tmp.empty:
-            # For converted CHOPCHOP "-" guides, choose guides nearest to insert site first.
-            tmp = tmp.sort_values("_abs_cut2ins", kind="stable")
-            subset = tmp.drop(columns=["_abs_cut2ins"], errors="ignore").reset_index(drop=True)
-        else:
-            subset = tmp.drop(columns=["_abs_cut2ins"], errors="ignore").reset_index(drop=True)
+        subset = tmp.drop(columns=["_abs_cut2ins"], errors="ignore").reset_index(drop=True)
 
     return subset
 
@@ -2881,13 +3400,11 @@ def write_guide_table_rows(handle, entry, enst_id, terminus, ranked_df):
         return
     for rank, (_, row) in enumerate(ranked_df.iterrows(), start=1):
         handle.write(
-            f"{entry},{enst_id},{terminus},{rank},{row.get('chr','')},{row.get('Insert_pos','')},{row.get('seq','')},{row.get('pam','')},"
-            f"{row.get('start','')},{row.get('end','')},{row.get('strand','')},{row.get('guideMITScore','')},{row.get('guideCfdScore','')},"
-            f"{row.get('guideCfdScorev2','')},{row.get('guideCfdScorev3','')},{row.get('Eff_scores','')},{row.get('Cut2Ins_dist','')},"
-            f"{row.get('spec_weight','')},{row.get('dist_weight','')},{row.get('pos_weight','')},{row.get('final_weight','')}\n"
+            f"{entry},{enst_id},{terminus},{rank},{row.get('chopchop_rank','')},{row.get('chr','')},{row.get('Insert_pos','')},{row.get('seq','')},{row.get('pam','')},"
+            f"{row.get('start','')},{row.get('end','')},{row.get('strand','')},{row.get('cut_pos','')},{row.get('target_region_label','')},{row.get('target_region_start','')},{row.get('target_region_end','')},"
+            f"{row.get('Eff_scores','')},{row.get('MM0','')},{row.get('MM1','')},{row.get('MM2','')},{row.get('MM3','')},{row.get('Cut2Ins_dist','')}\n"
         )
     handle.flush()
-
 
 def test_memory(n):
     """

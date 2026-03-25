@@ -1,0 +1,8 @@
+Entry,Ensembl_ID,Gene_Name,Target_terminus,Chromosome,Coordinate,Preferred_region,Preferred_exon,Preferred_anchor,Preferred_offset
+1,ENST00000334409.10,PDCD1,ALL,,,,,,
+2,ENST00000334409.10,PDCD1,,,,CDS,,start,0
+3,ENST00000334409.10,PDCD1,,,,exon,1,center,0
+4,ENST00000334409.10,PDCD1,,,,5UTR,,center,0
+5,ENST00000614167.2,B2M,C,,,,,,
+6,ENST00000614167.2,B2M,,,,3UTR,,end,-20
+7,ENST00000334409.10,PDCD1,,chr2,241849884,,,,

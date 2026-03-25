@@ -958,6 +958,10 @@ def main(custom_args=None):
         ha_out.write(
             "Entry,ID,terminus,design_rank,gRNA_name,gRNA_seq,insert_pos,left_HA,payload,right_HA,donor_final\n"
         )
+        recoding_out = open(os.path.join(outdir, "recoding_mutations.csv"), "w")
+        recoding_out.write(
+            "Entry,ID,terminus,design_rank,gRNA_name,donor_name,recoding_status,mutation_count,donor_before_recoding,donor_after_recoding,donor_final,recoding_mutations\n"
+        )
 
         # open result file and write header
         csvout_res = open(f"{outdir}/result.csv", "w")
@@ -1399,6 +1403,7 @@ def main(custom_args=None):
                         # donor features
                         donor_features = HDR_template.Donor_features
                         write_ha_csv_row(ha_out, Entry, ENST_ID, "-", i+1, gRNA_name, seq, insert_pos, HDR_template)
+                        write_recoding_summary_row(recoding_out, Entry, ENST_ID, "-", i+1, gRNA_name, donor_name, HDR_template, recoding_off=config["recoding_off"])
                         # write genbank file
                         with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                             write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1630,6 +1635,7 @@ def main(custom_args=None):
                     # donor features
                     donor_features = HDR_template.Donor_features
                     write_ha_csv_row(ha_out, Entry, ENST_ID, "N", i+1, gRNA_name, seq, insert_pos, HDR_template)
+                    write_recoding_summary_row(recoding_out, Entry, ENST_ID, "N", i+1, gRNA_name, donor_name, HDR_template, recoding_off=config["recoding_off"])
                     # write genbank file
                     with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                         write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1861,6 +1867,7 @@ def main(custom_args=None):
                     # donor features
                     donor_features = HDR_template.Donor_features
                     write_ha_csv_row(ha_out, Entry, ENST_ID, "C", i+1, gRNA_name, seq, insert_pos, HDR_template)
+                    write_recoding_summary_row(recoding_out, Entry, ENST_ID, "C", i+1, gRNA_name, donor_name, HDR_template, recoding_off=config["recoding_off"])
                     # write genbank file
                     with open(os.path.join(outdir, "genbank_files", f"{donor_name}.gb"), "w") as gb_handle:
                         write_genbank(handle = gb_handle, data_obj = HDR_template, donor_name = donor_name, donor_type = config["Donor_type"], payload_type = config["payload_type"])
@@ -1926,6 +1933,7 @@ def main(custom_args=None):
         csvout_res2.close()
         guides_out.close()
         ha_out.close()
+        recoding_out.close()
 
     except Exception as e:
         print("Unexpected error:", str(sys.exc_info()))
@@ -3060,6 +3068,43 @@ def write_ha_csv_row(handle, entry, enst_id, terminus, design_rank, gRNA_name, g
     )
 
 
+def summarize_recoding_mutations(ref_seq, alt_seq):
+    ref_seq = str(ref_seq or "")
+    alt_seq = str(alt_seq or "")
+    max_len = max(len(ref_seq), len(alt_seq))
+    mutations = []
+    for idx in range(max_len):
+        ref_base = ref_seq[idx] if idx < len(ref_seq) else "-"
+        alt_base = alt_seq[idx] if idx < len(alt_seq) else "-"
+        if ref_base != alt_base:
+            mutations.append(f"{idx+1}:{ref_base}>{alt_base}")
+    return mutations
+
+
+def write_recoding_summary_row(handle, entry, enst_id, terminus, design_rank, gRNA_name, donor_name, hdr_template, recoding_off=False):
+    donor_before = str(getattr(hdr_template, "Donor_vanillia", "") or "")
+    donor_after = str(getattr(hdr_template, "Donor_postMut", "") or "")
+    donor_final = str(getattr(hdr_template, "Donor_final", "") or "")
+    mutations = summarize_recoding_mutations(donor_before, donor_after)
+    status = "recoding_off" if recoding_off else ("recoded" if len(mutations) > 0 else "no_change")
+    handle.write(
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+            entry,
+            enst_id,
+            terminus,
+            design_rank,
+            gRNA_name,
+            donor_name,
+            status,
+            len(mutations),
+            donor_before,
+            donor_after,
+            donor_final,
+            ";".join(mutations),
+        )
+    )
+
+
 def get_insert_positions_from_local_enst(genome_ver, enst_id, cache=None):
     """
     Resolve N- and C-terminus insert positions for an ENST using local parsed annotations.
@@ -3441,3 +3486,6 @@ def PrintException():
 
 if __name__ == "__main__":
     main()
+
+
+

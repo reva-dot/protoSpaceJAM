@@ -68,6 +68,12 @@ Run it like this:
 python -m protoSpaceJAM.protoSpaceJAM --path2csv input/multi_target_template.csv --outdir output/example_run --annotation_source ensembl --ensembl_cache_dir output/ensembl_cache --num_gRNA_per_design 20 --max_cut2ins_dist 50 --payload_type insertion --payload_file payloads/bfp.txt --Donor_type dsDNA
 ```
 
+Example with explicit donor-arm and CHOPCHOP window options:
+
+```sh
+python -m protoSpaceJAM.protoSpaceJAM --path2csv input/multi_target_template.csv --outdir output/example_run --annotation_source ensembl --ensembl_cache_dir output/ensembl_cache --num_gRNA_per_design 20 --max_cut2ins_dist 100 --payload_type insertion --payload_file payloads/bfp.txt --Donor_type dsDNA --HA_len 500 --MinArmLenPostTrim 150 --chopchop_target_type WHOLE
+```
+
 ### Option B: One target directly from the command line
 
 ```sh
@@ -154,6 +160,7 @@ So:
 This is the most important rule for knock-in rescue designs:
 - `Preferred_region=CDS` means coding sequence only
 - `Preferred_region=CDS` + `Preferred_exon=1` means the CDS portion of exon 1, not the whole exon
+- the CDS does **not** have to begin in exon 1; `Preferred_region=CDS` + `Preferred_anchor=start` resolves to the first translated base of the transcript, even if that is in exon 2 or later
 
 This is useful when you want guides whose **cut position** lands in the coding segment of exon 1 rather than in UTR sequence.
 
@@ -223,9 +230,19 @@ Each run writes a main output folder containing the design tables and per-design
   - includes:
     - `chopchop_rank`
     - `cut_pos`
+    - `cut_region_class`
+    - `cut_region_label_detailed`
+    - `cut_region_exon`
+    - `cut_position_types`
     - `target_region_label`
     - `target_region_start`
     - `target_region_end`
+    - `resolved_region_label`
+    - `resolved_region_start`
+    - `resolved_region_end`
+    - `resolved_anchor`
+    - `resolved_offset`
+    - `resolved_coordinate`
     - `MM0`, `MM1`, `MM2`, `MM3`
     - `Cut2Ins_dist`
 
@@ -280,6 +297,17 @@ python protoSpaceJAM/util/score_existing_donor_cfd.py --guide-seq GAGTCTCTCCTCTT
 
 This scans the supplied sequence on both strands and reports the highest-scoring CFD windows.
 
+## Useful CLI Options
+
+- `--HA_len <int>`: dsDNA homology-arm length on each side before any trimming. Default: `500`
+- `--MinArmLenPostTrim <int>`: minimum dsDNA arm length to preserve after synthesis-motivated trimming. `0` disables trimming. Default: `0`
+- `--ssODN_max_size <int>`: total ssODN length limit used when centering payload plus recoded sequence. Default: `200`
+- `--chopchop_target_type CODING|WHOLE`: CHOPCHOP sequence-window target mode. `WHOLE` is useful when you want intronic or UTR guides in the fetched genomic window rather than coding-only guides
+- `--guides_only`: guide-discovery/debug mode that skips donor design and writes only the guide tables
+- `--specificity_backend default|chopchop_proxy|crispor`: choose how CHOPCHOP-derived guides are post-scored
+- `--crispor_cmd_template <string>`: required when `--specificity_backend crispor` is used
+- `--chopchop_debug_dump`: save the exact CHOPCHOP request payload and fetched sequence window for debugging
+
 ## Advanced / Legacy Local Workflows
 
 The old precomputed genome-wide guide-resource workflow is still part of the repository, but it is no longer required for standard CHOPCHOP + Ensembl usage.
@@ -294,11 +322,37 @@ For most new users, you can ignore that directory.
 ### My guides are not in the region I expected
 Check:
 - `guides_from_chopchop.csv`
+- `cut_region_class`
+- `cut_region_label_detailed`
+- `cut_region_exon`
+- `cut_position_types`
 - `target_region_label`
 - `target_region_start`
 - `target_region_end`
+- `resolved_region_label`
+- `resolved_coordinate`
 - `cut_pos`
 - `GRCh38_<ENST>.regions.json`
+
+Interpretation:
+- `resolved_*` columns describe the requested anchor that protoSpaceJAM resolved from your CSV row
+- `cut_region_*` columns describe where each guide actually cuts
+- these are not always identical, because the tool currently resolves an insertion coordinate first and then finds nearby guides by cut distance
+
+### I want intronic guides near a CDS anchor
+Do not rely on CHOPCHOP gene-name mode.
+
+Instead:
+- use a coordinate-based row or a `Preferred_region` row that resolves to a coordinate
+- leave `Gene_Name` blank if you want sequence-window submission rather than CHOPCHOP gene mode
+- consider `--chopchop_target_type WHOLE` so CHOPCHOP can return guides outside coding sequence in the fetched window
+
+### What does dsDNA trimming change?
+protoSpaceJAM may trim dsDNA donor arms for synthesis constraints, but it preserves homology arms subject to your minimum post-trim threshold.
+
+Use:
+- `--HA_len` to choose the starting arm size
+- `--MinArmLenPostTrim` to control how short an arm may become after trimming
 
 ### My row is not using the preferred region I asked for
 Check whether the CSV row also has:

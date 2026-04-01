@@ -2918,7 +2918,7 @@ class HDR_flank:
         """
         return the genomic coordinates of the GG in PAM
         """
-        if self.ENST_strand == 1:
+        if self.gStrand == 1:
             return [self.gStart + 21, self.gStart + 22]
         else:
             return [self.gStart - 21, self.gStart - 22]

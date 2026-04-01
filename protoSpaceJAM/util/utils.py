@@ -283,9 +283,10 @@ def get_HDR_template(
         InsPos = row[
             "Insert_pos"
         ]  # InsPos is the first letter of stop codon "T"AA or the last letter of the start codon AT"G", or the letter before the payload insertion in genomics-coord intersion mode,  in SNP mode, it is the first letter of the SNP payload replacement
-        gStart = row["start"]
         gStrand = convert_strand(row["strand"])  # gRNA strand
-        CutPos = get_cut_pos(gStart, gStrand)
+        guide_lo, guide_hi = _normalize_guide_bounds(row["start"], row["end"])
+        gStart = guide_lo if gStrand == 1 else guide_hi
+        CutPos = get_cut_pos(row["start"], row["end"], gStrand)
         Cut2Ins_dist = row["Cut2Ins_dist"]
 
         ##########################
@@ -746,7 +747,7 @@ def rank_gRNAs_for_tagging(
         end = row[3]
         strand = row[4]
         # Get cut to insert distance
-        cutPos = get_cut_pos(start, strand)
+        cutPos = get_cut_pos(start, end, strand)
         cut2insDist = cutPos - insPos
 
         # adjust cut2insDist
@@ -837,7 +838,7 @@ def _decorate_guides_for_hdr_without_reranking(loc, gRNA_df, ENST_ID, ENST_stran
 
     cut2insDist_list = []
     for _, row in gRNA_df.iterrows():
-        cutPos = get_cut_pos(row["start"], row["strand"])
+        cutPos = get_cut_pos(row["start"], row["end"], row["strand"])
         cut2insDist = cutPos - insPos
         if type == "start" and ENST_strand == -1:
             cut2insDist += 1
@@ -858,18 +859,28 @@ def _decorate_guides_for_hdr_without_reranking(loc, gRNA_df, ENST_ID, ENST_stran
     return gRNA_df
 
 
-def get_cut_pos(start, strand):
+def _normalize_guide_bounds(start, end):
+    try:
+        s = int(float(start))
+        e = int(float(end))
+    except Exception:
+        return (None, None)
+    return (min(s, e), max(s, e))
+
+
+def get_cut_pos(start, end, strand):
     """
-    start:gRNA start
+    start/end:gRNA genomic span, normalized or legacy
     strand:gRNA strand
+    Returns the genomic base immediately upstream of the cut using the
+    protoSpaceJAM historical convention.
     """
+    lo, hi = _normalize_guide_bounds(start, end)
+    if lo is None or hi is None:
+        return None
     if strand == "+" or strand == "1" or strand == 1:
-        cutPos = start + 16
-    else:
-        cutPos = (
-            start - 16 - 1
-        )  # -1 because we want the cutsite to be behind the pos (viewed in the +1 strand)
-    return cutPos
+        return lo + 16
+    return hi - 17
 
 
 def _terminal_cds_region_for_terminus(ENST_ID, ENST_info, terminus_type):
@@ -894,7 +905,7 @@ def _filter_guides_to_terminal_cds(ENST_ID, ENST_info, gRNA_df, terminus_type):
         return gRNA_df
     lo, hi = int(interval[0]), int(interval[1])
     tmp = gRNA_df.copy()
-    tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+    tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["end"], r["strand"]), axis=1)
     tmp = tmp[
         pd.to_numeric(tmp["_cut_pos"], errors="coerce").notna()
         & (pd.to_numeric(tmp["_cut_pos"], errors="coerce") >= lo)
@@ -911,13 +922,13 @@ def _annotate_guides_with_target_interval(gRNA_df, region_label, interval):
     if interval is None:
         out["target_region_start"] = float("nan")
         out["target_region_end"] = float("nan")
-        out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+        out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["end"], r["strand"]), axis=1)
         out["cut_in_target_region"] = float("nan")
         return out
     lo, hi = int(interval[0]), int(interval[1])
     out["target_region_start"] = lo
     out["target_region_end"] = hi
-    out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+    out["cut_pos"] = out.apply(lambda r: get_cut_pos(r["start"], r["end"], r["strand"]), axis=1)
     out["cut_in_target_region"] = (
         pd.to_numeric(out["cut_pos"], errors="coerce").notna()
         & (pd.to_numeric(out["cut_pos"], errors="coerce") >= lo)
@@ -1514,12 +1525,10 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
         end = end + int(window_start) - 1
 
     if start_col is None or end_col is None:
-        # Approximate 20nt protospacer span when only one genomic location is provided.
+        # Approximate a genomic-low -> genomic-high protospacer span when only one
+        # genomic location is provided.
         seq_len = full_seq.str.len().where(full_seq.str.len() > 0, 20)
-        plus_mask = strand == "+"
-        minus_mask = strand == "-"
-        end = end.where(~plus_mask, start + seq_len - 1)
-        end = end.where(~minus_mask, start - seq_len + 1)
+        end = start + seq_len - 1
 
     df = pd.DataFrame(index=df_raw.index)
     df["chr"] = str(chr_name) if chr_name is not None else ""
@@ -1534,8 +1543,8 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     pam_guess = full_seq.where(full_seq.str.len() < 23, full_seq.str.slice(-3))
     df["seq"] = seq_guess
     df["pam"] = df_raw[pam_col].astype(str).str.upper() if pam_col else pam_guess.fillna(str(pam).upper())
-    df["start"] = start.round().astype("Int64")
-    df["end"] = end.round().astype("Int64")
+    df["start"] = pd.concat([start, end], axis=1).min(axis=1).round().astype("Int64")
+    df["end"] = pd.concat([start, end], axis=1).max(axis=1).round().astype("Int64")
     df["strand"] = strand
 
     eff_scores = _best_numeric_series(
@@ -1561,19 +1570,6 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
         pam=pam,
         scorer_config=None,
     )
-
-    # Keep legacy convention: for '-' guides, start > end.
-    neg = df["strand"] == "-"
-    swap_idx = neg & (df["start"] < df["end"])
-    start_swap = df.loc[swap_idx, "start"].copy()
-    df.loc[swap_idx, "start"] = df.loc[swap_idx, "end"]
-    df.loc[swap_idx, "end"] = start_swap
-
-    pos = df["strand"] == "+"
-    swap_idx = pos & (df["start"] > df["end"])
-    start_swap = df.loc[swap_idx, "start"].copy()
-    df.loc[swap_idx, "start"] = df.loc[swap_idx, "end"]
-    df.loc[swap_idx, "end"] = start_swap
 
     df = df.dropna(subset=["start", "end"])
     df["start"] = df["start"].astype(int)
@@ -1716,13 +1712,14 @@ def _extract_job_id_from_text(text):
 def _default_chopchop_web_payload(target_seq, genome_ver, pam, chopchop_config, gene_input=""):
     chopchop_genome = GENOME_TO_CHOPCHOP.get(genome_ver, "hg38")
     window_df = int(chopchop_config.get("window_padding", 80)) * 2 + 100
+    target_type = str(chopchop_config.get("target_type", "CODING")).upper().strip()
     return {
         "opts": [
             "-J", "-BED", "-GenBank",
             "-G", chopchop_genome,
             "-filterGCmin", "10",
             "-filterGCmax", "90",
-            "-t", "CODING",
+            "-t", target_type,
             "-n", "N",
             "-R", "4",
             "-P",
@@ -1784,6 +1781,10 @@ def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
                     continue
                 if tok == "-G" and i + 1 < len(payload["opts"]):
                     opts.extend(["-G", GENOME_TO_CHOPCHOP.get(genome_ver, payload["opts"][i + 1])])
+                    i += 2
+                    continue
+                if tok == "-t" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-t", str(chopchop_config.get("target_type", payload["opts"][i + 1])).upper()])
                     i += 2
                     continue
                 opts.append(tok)
@@ -1901,6 +1902,26 @@ def get_chopchop_raw_results(loc, dist, genome_ver, pam, chopchop_config):
         payload = json.loads(payload_json)
         payload["fastaInput"] = target_seq
         payload["geneInput"] = payload.get("geneInput", "")
+        if "opts" in payload and isinstance(payload["opts"], list):
+            opts = []
+            i = 0
+            while i < len(payload["opts"]):
+                tok = payload["opts"][i]
+                if tok == "-M" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-M", str(pam).upper()])
+                    i += 2
+                    continue
+                if tok == "-G" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-G", GENOME_TO_CHOPCHOP.get(genome_ver, payload["opts"][i + 1])])
+                    i += 2
+                    continue
+                if tok == "-t" and i + 1 < len(payload["opts"]):
+                    opts.extend(["-t", str(chopchop_config.get("target_type", payload["opts"][i + 1])).upper()])
+                    i += 2
+                    continue
+                opts.append(tok)
+                i += 1
+            payload["opts"] = opts
     else:
         payload = _default_chopchop_web_payload(
             target_seq=target_seq,
@@ -2048,7 +2069,7 @@ def get_gRNAs_near_loc(
 
     if use_cut_distance_filter:
         tmp = df_gRNA.copy()
-        tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["strand"]), axis=1)
+        tmp["_cut_pos"] = tmp.apply(lambda r: get_cut_pos(r["start"], r["end"], r["strand"]), axis=1)
         tmp["_abs_cut2ins"] = pd.to_numeric(tmp["_cut_pos"], errors="coerce").sub(float(pos)).abs()
         tmp = tmp[tmp["_abs_cut2ins"].notna()]
         tmp = tmp[tmp["_abs_cut2ins"] <= float(dist)]

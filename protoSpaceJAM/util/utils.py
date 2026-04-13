@@ -10,6 +10,7 @@ import pickle
 import logging
 import time
 import json
+import hashlib
 import subprocess
 import tempfile
 import re
@@ -395,13 +396,19 @@ def get_HDR_arms(loc, half_len, type, genome_ver):
             [5'arm, 3'arm]
     """
     Chr, Pos, Strand = loc
+    if isinstance(half_len, dict):
+        left_len = int(half_len.get("left", half_len.get("L", 0)))
+        right_len = int(half_len.get("right", half_len.get("R", 0)))
+    else:
+        left_len = int(half_len)
+        right_len = int(half_len)
     # get arms
     vanilla_left_arm, vanilla_right_arm = None, None
     if type == "start":
         if Strand == 1:
             vanilla_left_arm = get_seq(
                 chr=Chr,
-                start=Pos - half_len + 1,
+                start=Pos - left_len + 1,
                 end=Pos + 1,
                 strand=1,
                 genome_ver=genome_ver,
@@ -409,55 +416,55 @@ def get_HDR_arms(loc, half_len, type, genome_ver):
             vanilla_right_arm = get_seq(
                 chr=Chr,
                 start=Pos + 1,
-                end=Pos + half_len + 1,
+                end=Pos + right_len + 1,
                 strand=1,
                 genome_ver=genome_ver,
             )
             return [
                 vanilla_left_arm,
                 vanilla_right_arm,
-                Pos - half_len + 1,
+                Pos - left_len + 1,
                 Pos,
                 Pos + 1,
-                Pos + half_len,
+                Pos + right_len,
             ]
         elif Strand == -1:
             vanilla_left_arm = get_seq(
-                chr=Chr, start=Pos - half_len, end=Pos, strand=1, genome_ver=genome_ver
+                chr=Chr, start=Pos - right_len, end=Pos, strand=1, genome_ver=genome_ver
             )
             vanilla_right_arm = get_seq(
-                chr=Chr, start=Pos, end=Pos + half_len, strand=1, genome_ver=genome_ver
+                chr=Chr, start=Pos, end=Pos + left_len, strand=1, genome_ver=genome_ver
             )
             return [
                 reverse_complement(vanilla_right_arm),
                 reverse_complement(vanilla_left_arm),
-                Pos + half_len - 1,
+                Pos + left_len - 1,
                 Pos,
                 Pos - 1,
-                Pos - half_len,
+                Pos - right_len,
             ]
         else:
             sys.exit(f"unknown strand: {Strand}, acceptable values are -1 and 1")
     elif type == "stop":
         if Strand == 1:
             vanilla_left_arm = get_seq(
-                chr=Chr, start=Pos - half_len, end=Pos, strand=1, genome_ver=genome_ver
+                chr=Chr, start=Pos - left_len, end=Pos, strand=1, genome_ver=genome_ver
             )
             vanilla_right_arm = get_seq(
-                chr=Chr, start=Pos, end=Pos + half_len, strand=1, genome_ver=genome_ver
+                chr=Chr, start=Pos, end=Pos + right_len, strand=1, genome_ver=genome_ver
             )
             return [
                 vanilla_left_arm,
                 vanilla_right_arm,
-                Pos - half_len,
+                Pos - left_len,
                 Pos - 1,
                 Pos,
-                Pos + half_len - 1,
+                Pos + right_len - 1,
             ]
         elif Strand == -1:
             vanilla_left_arm = get_seq(
                 chr=Chr,
-                start=Pos - half_len + 1,
+                start=Pos - right_len + 1,
                 end=Pos + 1,
                 strand=1,
                 genome_ver=genome_ver,
@@ -465,17 +472,17 @@ def get_HDR_arms(loc, half_len, type, genome_ver):
             vanilla_right_arm = get_seq(
                 chr=Chr,
                 start=Pos + 1,
-                end=Pos + half_len + 1,
+                end=Pos + left_len + 1,
                 strand=1,
                 genome_ver=genome_ver,
             )
             return [
                 reverse_complement(vanilla_right_arm),
                 reverse_complement(vanilla_left_arm),
-                Pos + half_len,
+                Pos + left_len,
                 Pos + 1,
                 Pos,
-                Pos - half_len + 1,
+                Pos - right_len + 1,
             ]
     else:
         sys.exit("unknown type {type}, acceptable values: start, stop")
@@ -1213,7 +1220,60 @@ def _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver):
     return f"https://rest.ensembl.org/sequence/region/{species}/{region}"
 
 
+def _ensembl_seq_cache_path(chrom, start, end, strand, genome_ver):
+    cache_root = str(os.environ.get("PROTOSPACEJAM_ENSEMBL_SEQ_CACHE_DIR", "")).strip()
+    if cache_root == "":
+        return ""
+    chrom = _canonize_chromosome(chrom)
+    strand_token = "1" if str(strand) in ("1", "+", "plus") else "-1"
+    key = f"{genome_ver}|{chrom}|{int(start)}|{int(end)}|{strand_token}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    cache_dir = os.path.join(cache_root, "sequence_cache", str(genome_ver))
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(
+        cache_dir,
+        f"{str(chrom).replace(':', '_')}_{int(start)}_{int(end)}_{strand_token}_{digest}.json",
+    )
+
+
+def _load_cached_ensembl_sequence(chrom, start, end, strand, genome_ver):
+    cache_path = _ensembl_seq_cache_path(chrom, start, end, strand, genome_ver)
+    if cache_path == "" or not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, "r") as fh:
+            data = json.load(fh)
+        seq = str(data.get("seq", "")).upper()
+        if seq != "":
+            return seq
+    except Exception:
+        pass
+    return None
+
+
+def _write_cached_ensembl_sequence(chrom, start, end, strand, genome_ver, seq):
+    cache_path = _ensembl_seq_cache_path(chrom, start, end, strand, genome_ver)
+    if cache_path == "":
+        return
+    payload = {
+        "chrom": _canonize_chromosome(chrom),
+        "start": int(start),
+        "end": int(end),
+        "strand": 1 if str(strand) in ("1", "+", "plus") else -1,
+        "genome_ver": str(genome_ver),
+        "seq": str(seq).upper(),
+    }
+    try:
+        with open(cache_path, "w") as fh:
+            json.dump(payload, fh)
+    except Exception:
+        pass
+
+
 def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=30, max_retries=5):
+    cached_seq = _load_cached_ensembl_sequence(chrom, start, end, strand, genome_ver)
+    if cached_seq is not None:
+        return cached_seq
     url = _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver)
     last_exc = None
     for attempt in range(max(1, int(max_retries))):
@@ -1231,7 +1291,9 @@ def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=3
                 raise RuntimeError(
                     f"Ensembl sequence response missing 'seq' for {chrom}:{start}-{end}"
                 )
-            return data["seq"].upper()
+            seq = data["seq"].upper()
+            _write_cached_ensembl_sequence(chrom, start, end, strand, genome_ver, seq)
+            return seq
         except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
             last_exc = exc
             is_http_5xx = isinstance(exc, HTTPError) and 500 <= int(exc.code) < 600
@@ -1453,6 +1515,9 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     if df_raw is None or df_raw.empty:
         return _empty_guides_df()
 
+    raw_attrs = getattr(df_raw, "attrs", {}) or {}
+    raw_window_start = int(raw_attrs.get("window_start", window_start))
+
     cols = {c.lower().strip(): c for c in df_raw.columns}
     seq_col = None
     for key in ["seq", "sequence", "guide", "target", "targetsequence", "target sequence", "sgrna"]:
@@ -1505,12 +1570,15 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
         end = pd.to_numeric(df_raw[end_col], errors="coerce")
     else:
         # results.tsv exposes one genomic position; approximate start/end from that anchor.
-        anchor = (
+        extracted_loc = (
             df_raw[genomic_loc_col]
             .astype(str)
-            .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")["pos"]
+            .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")
         )
+        anchor = extracted_loc["pos"]
         anchor = pd.to_numeric(anchor, errors="coerce")
+        local_seq_mask = extracted_loc["chr"].astype(str).str.lower().eq("seq")
+        anchor = anchor.where(~local_seq_mask, anchor + int(raw_window_start) - 1)
         start = anchor.copy()
         end = anchor.copy()
 
@@ -1521,8 +1589,8 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
     # CHOPCHOP outputs may be local window coordinates; convert when needed.
     max_coord = pd.concat([start, end], axis=1).max(axis=1)
     if max_coord.max(skipna=True) <= 5000:
-        start = start + int(window_start) - 1
-        end = end + int(window_start) - 1
+        start = start + int(raw_window_start) - 1
+        end = end + int(raw_window_start) - 1
 
     if start_col is None or end_col is None:
         # Approximate a genomic-low -> genomic-high protospacer span when only one
@@ -1538,6 +1606,7 @@ def _standardize_chopchop_df(df_raw, chr_name, pam, window_start):
             .astype(str)
             .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")["chr"]
         )
+        extracted_chr = extracted_chr.where(~extracted_chr.astype(str).str.lower().eq("seq"), df["chr"])
         df["chr"] = extracted_chr.fillna(df["chr"])
     seq_guess = full_seq.where(full_seq.str.len() <= 20, full_seq.str.slice(0, 20))
     pam_guess = full_seq.where(full_seq.str.len() < 23, full_seq.str.slice(-3))
@@ -1591,6 +1660,8 @@ def convert_chopchop_raw_to_psj(
     Convert raw CHOPCHOP results.tsv table to protoSpaceJAM guide schema.
     Keeps CHOPCHOP order.
     """
+    if hasattr(df_raw, "attrs") and "window_start" in df_raw.attrs:
+        window_start = int(df_raw.attrs.get("window_start", window_start))
     df = _standardize_chopchop_df(
         df_raw=df_raw,
         chr_name=default_chr or "",
@@ -1617,7 +1688,11 @@ def convert_chopchop_raw_to_psj(
             .str.extract(r"(?P<chr>[^:]+):(?P<pos>\d+)")
         )
         if "chr" in extracted.columns:
-            df["chr"] = extracted["chr"].fillna(default_chr if default_chr is not None else "")
+            extracted_chr = extracted["chr"].where(
+                ~extracted["chr"].astype(str).str.lower().eq("seq"),
+                default_chr if default_chr is not None else "",
+            )
+            df["chr"] = extracted_chr.fillna(default_chr if default_chr is not None else "")
 
     if desired_insert_pos is not None:
         df["Insert_pos"] = int(desired_insert_pos)
@@ -1637,8 +1712,8 @@ def _run_chopchop_from_template(loc, dist, genome_ver, pam, chopchop_config):
 
     chrom, pos, _strand = loc
     flank = int(chopchop_config.get("window_padding", 80))
-    window_start = max(1, int(pos) - int(dist) - flank)
-    window_end = int(pos) + int(dist) + flank
+    window_start = int(chopchop_config.get("window_start_override", max(1, int(pos) - int(dist) - flank)))
+    window_end = int(chopchop_config.get("window_end_override", int(pos) + int(dist) + flank))
     target_seq = fetch_sequence_from_ensembl(
         chrom=chrom,
         start=window_start,
@@ -1752,8 +1827,8 @@ def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
     chrom, pos, _strand = loc
     gene_input = str(chopchop_config.get("gene_input", "")).strip()
     flank = int(chopchop_config.get("window_padding", 80))
-    window_start = max(1, int(pos) - int(dist) - flank)
-    window_end = int(pos) + int(dist) + flank
+    window_start = int(chopchop_config.get("window_start_override", max(1, int(pos) - int(dist) - flank)))
+    window_end = int(chopchop_config.get("window_end_override", int(pos) + int(dist) + flank))
     target_seq = ""
     if gene_input == "":
         target_seq = fetch_sequence_from_ensembl(
@@ -1969,7 +2044,11 @@ def get_chopchop_raw_results(loc, dist, genome_ver, pam, chopchop_config):
             with urlopen(req_results, timeout=30) as res:
                 txt = res.read().decode("utf-8", errors="ignore")
             if "Target sequence" in txt or "Rank\t" in txt:
-                return pd.read_csv(StringIO(txt), sep="\t")
+                df_raw = pd.read_csv(StringIO(txt), sep="\t")
+                df_raw.attrs["window_start"] = int(window_start)
+                df_raw.attrs["window_end"] = int(window_end)
+                df_raw.attrs["chrom"] = str(chrom)
+                return df_raw
         except Exception as exc:
             last_error = exc
         time.sleep(poll_sec)
@@ -2163,6 +2242,9 @@ def get_seq(chr, start, end, strand, genome_ver):
     else:
         use_ensembl_fallback = os.environ.get("PROTOSPACEJAM_USE_ENSEMBL_SEQ", "1")
         if use_ensembl_fallback == "1":
+            # TODO: add a persistent region-level sequence cache under ensembl_cache_dir
+            # keyed by genome/chrom/start/end/strand. This should avoid repeated Ensembl REST
+            # calls for the same windows without requiring bulky whole-chromosome pickle files.
             log.warning(
                 f"Local genome pickle not found ({chr_file_path}); fetching region from Ensembl REST."
             )

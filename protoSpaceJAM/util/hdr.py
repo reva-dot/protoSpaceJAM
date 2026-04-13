@@ -560,7 +560,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase2 = Donor[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase2 = Donor[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase2 = Donor[-len(self.right_flk_seq) :]
                 # mutate protospacer
                 (
                     left,
@@ -605,7 +605,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase2 = Donor[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase2 = Donor[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase2 = Donor[-len(self.right_flk_seq) :]
 
                         # early stop if CFD goes below self.cfdThres
                         if (
@@ -670,7 +670,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase2 = Donor[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase2 = Donor[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase2 = Donor[-len(self.right_flk_seq) :]
 
                 left, right, cfd, seq, phases = self.get_uptodate_mut()
                 self.postPhase2ODN = left + tag + right
@@ -759,7 +759,7 @@ class HDR_flank:
                 Donor = Donor.replace(self.revcom(seq), self.revcom(untrimmed))
 
                 self.left_flk_seq_Phase3 = Donor[0 : len(self.left_flk_seq)]
-                self.right_flk_seq_Phase3 = Donor[-len(self.left_flk_seq) :]
+                self.right_flk_seq_Phase3 = Donor[-len(self.right_flk_seq) :]
                 
                 # put mutated seq back to arms
                 # self.left_flk_seq_Phase3, self.right_flk_seq_Phase3 = self.put_silent_mutation_subseq_back(L_arm=self.left_flk_seq_CodonMut, R_arm=self.right_flk_seq_CodonMut,
@@ -852,7 +852,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase4 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase4 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase4 = ssODN[-len(self.right_flk_seq) :]
 
                 # mutate protospacer
                 (
@@ -899,7 +899,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase4 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase4 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase4 = ssODN[-len(self.right_flk_seq) :]
 
                         # early stop if CFD goes below self.cfdThres
                         if (
@@ -964,7 +964,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase4 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase4 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase4 = ssODN[-len(self.right_flk_seq) :]
 
             left, right, cfd, seq, phases = self.get_uptodate_mut()
             self.postPhase4ODN = left + tag + right
@@ -1023,7 +1023,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase5 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase5 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase5 = ssODN[-len(self.right_flk_seq) :]
 
                 # mutate protospacer
                 (
@@ -1074,7 +1074,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase5 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase5 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase5 = ssODN[-len(self.right_flk_seq) :]
 
                         # early stop if CFD goes below self.cfdThres
                         if (
@@ -1127,7 +1127,7 @@ class HDR_flank:
                         )
 
                         self.left_flk_seq_Phase5 = ssODN[0 : len(self.left_flk_seq)]
-                        self.right_flk_seq_Phase5 = ssODN[-len(self.left_flk_seq) :]
+                        self.right_flk_seq_Phase5 = ssODN[-len(self.right_flk_seq) :]
 
                 if hasattr(self, "cfd_score_post_Phase5"):
                     self.info_Phase5_5UTR = [cfd, self.cfd_score_post_Phase5]
@@ -1753,7 +1753,7 @@ class HDR_flank:
         # return a list of start,end pairs for the stretches of differences between two strings
         # Ensure both strings are of the same length
         if len(str1) != len(str2):
-            return "Strings are not of the same length."
+            return []
         
         differences = []
         in_diff = False
@@ -1782,6 +1782,24 @@ class HDR_flank:
             differences.append((start, len(str1) - 1))
         
         return differences
+
+    def _lowercase_runs(self, seq, offset=0):
+        runs = []
+        if seq is None:
+            return runs
+        in_run = False
+        run_start = 0
+        for idx, base in enumerate(seq):
+            if str(base).islower():
+                if not in_run:
+                    run_start = idx
+                    in_run = True
+            elif in_run:
+                runs.append((offset + run_start, offset + idx - 1))
+                in_run = False
+        if in_run:
+            runs.append((offset + run_start, offset + len(seq) - 1))
+        return runs
     
     def apply_ssODN_centering_to_coords(self, start_end_tuple):
         """
@@ -1919,16 +1937,25 @@ class HDR_flank:
         """
         return the coordinates of the features in the donor
         """
-        gRNA_coord = self.compare_stretches(f"{self.left_flk_seq}{self.tag}{self.right_flk_seq}", f"{self.gRNA_lc_Larm}{self.tag}{self.gRNA_lc_Rarm}", case_sensitive=True)
-        recoding_coord = self.compare_stretches(self.Donor_vanillia, self.Donor_postMut, case_sensitive=False)
+        left_len = len(self.left_flk_seq)
+        right_len = len(self.right_flk_seq)
+        tag_len = len(self.tag)
+        gRNA_coord = self._lowercase_runs(self.gRNA_lc_Larm, 0) + self._lowercase_runs(
+            self.gRNA_lc_Rarm, left_len + tag_len
+        )
+        donor_recode_target = getattr(self, "Donor_final", self.Donor_postMut)
+        recoding_coord = self.compare_stretches(self.Donor_vanillia, donor_recode_target, case_sensitive=False)
         # adjustment for SNP mode (5 of 5)
         # 
         if self.payload_type == "SNP": 
-            gRNA_coord = self.compare_stretches(f"{self.left_flk_seq}{self.right_flk_seq}", f"{self.gRNA_lc_Larm}{self.gRNA_lc_Rarm}", case_sensitive=True)
-            recoding_coord = self.compare_stretches(f"{self.gRNA_lc_Larm}{self.gRNA_lc_Rarm}", f"{self.Donor_postMut_before_SNP}", case_sensitive=False) # Donor_postMut does not include the tag -> SNP replacement, therefore we can compare with the left + right HA arms
-        left_arm_coord = [0, len(self.gRNA_lc_Larm)-1]
-        right_arm_coord = [len(self.gRNA_lc_Larm) + len(self.tag), len(self.Donor_vanillia)-1]
-        tag_coord = [len(self.gRNA_lc_Larm), len(self.gRNA_lc_Larm) + len(self.tag)-1]
+            gRNA_coord = self._lowercase_runs(self.gRNA_lc_Larm, 0) + self._lowercase_runs(
+                self.gRNA_lc_Rarm, left_len
+            )
+            donor_recode_target = getattr(self, "Donor_final", self.Donor_postMut_before_SNP)
+            recoding_coord = self.compare_stretches(f"{self.gRNA_lc_Larm}{self.gRNA_lc_Rarm}", f"{donor_recode_target}", case_sensitive=False) # Donor_postMut does not include the tag -> SNP replacement, therefore we can compare with the left + right HA arms
+        left_arm_coord = [0, left_len - 1]
+        right_arm_coord = [left_len + tag_len, left_len + tag_len + right_len - 1]
+        tag_coord = [left_len, left_len + tag_len - 1]
         HA_payload_strand = 1 # ssODN strand (1 for nonflipped, -1 for flipped)
 
         if self.Donor_type == "ssODN":
@@ -2021,17 +2048,20 @@ class HDR_flank:
             })
     
     def compute_payloadless_donor_feature_coordinates(self):
-        gRNA_coord = self.compare_stretches(f"{self.left_flk_seq}{self.right_flk_seq}", f"{self.gRNA_lc_Larm}{self.gRNA_lc_Rarm}", case_sensitive=True)
-        #gRNA_coord[1] += 1 # gRNA end offset 
-        left_arm_coord = [0, len(self.gRNA_lc_Larm)-1]
-        right_arm_coord = [len(self.gRNA_lc_Larm), len(self.gRNA_lc_Larm)+len(self.gRNA_lc_Rarm)-1]
+        left_len = len(self.left_flk_seq)
+        right_len = len(self.right_flk_seq)
+        gRNA_coord = self._lowercase_runs(self.gRNA_lc_Larm, 0) + self._lowercase_runs(
+            self.gRNA_lc_Rarm, left_len
+        )
+        left_arm_coord = [0, left_len - 1]
+        right_arm_coord = [left_len, left_len + right_len - 1]
         HA_payload_strand = 1 # ssODN strand (1 for nonflipped, -1 for flipped)
 
         if self.Donor_type == "ssODN":
             gRNA_coord = [i for i in gRNA_coord if i] # remove None values
 
             if self.strand_flipped: # flip the coordinates to matched the flipped strand
-                _len = len(self.gRNA_lc_Larm) + len(self.gRNA_lc_Rarm)
+                _len = left_len + right_len
                 gRNA_coord = [[_len - i[1], _len - i[0]] for i in gRNA_coord]
                 left_arm_coord = [_len - left_arm_coord[1], _len - left_arm_coord[0]]
                 right_arm_coord = [_len - right_arm_coord[1], _len - right_arm_coord[0]]

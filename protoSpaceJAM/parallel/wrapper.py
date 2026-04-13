@@ -56,6 +56,20 @@ def parse_args():
         metavar="",
     )
     parser.add_argument(
+        "--left_HA_len",
+        default=None,
+        help="optional left homology arm length override for dsDNA donors",
+        type=int,
+        metavar="",
+    )
+    parser.add_argument(
+        "--right_HA_len",
+        default=None,
+        help="optional right homology arm length override for dsDNA donors",
+        type=int,
+        metavar="",
+    )
+    parser.add_argument(
         "--Donor_type",
         default="ssODN",
         help="ssODN(default) or dsDNA",

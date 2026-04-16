@@ -1212,10 +1212,18 @@ def _canonize_chromosome(chr_name):
     return chr_name
 
 
+def _normalize_seq_strand(strand):
+    return 1 if str(strand) in ("1", "+", "plus") else -1
+
+
+def _expected_sequence_length(start, end):
+    return int(end) - int(start) + 1
+
+
 def _build_ensembl_sequence_url(chrom, start, end, strand, genome_ver):
     species, _assembly = GENOME_TO_ENSEMBL.get(genome_ver, ("homo_sapiens", "GRCh38"))
     chrom = _canonize_chromosome(chrom)
-    strand_num = 1 if str(strand) in ("1", "+", "plus") else -1
+    strand_num = _normalize_seq_strand(strand)
     region = f"{chrom}:{int(start)}..{int(end)}:{strand_num}"
     return f"https://rest.ensembl.org/sequence/region/{species}/{region}"
 
@@ -1225,7 +1233,7 @@ def _ensembl_seq_cache_path(chrom, start, end, strand, genome_ver):
     if cache_root == "":
         return ""
     chrom = _canonize_chromosome(chrom)
-    strand_token = "1" if str(strand) in ("1", "+", "plus") else "-1"
+    strand_token = "1" if _normalize_seq_strand(strand) == 1 else "-1"
     key = f"{genome_ver}|{chrom}|{int(start)}|{int(end)}|{strand_token}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     cache_dir = os.path.join(cache_root, "sequence_cache", str(genome_ver))
@@ -1244,7 +1252,19 @@ def _load_cached_ensembl_sequence(chrom, start, end, strand, genome_ver):
         with open(cache_path, "r") as fh:
             data = json.load(fh)
         seq = str(data.get("seq", "")).upper()
-        if seq != "":
+        expected_len = _expected_sequence_length(start, end)
+        if (
+            seq != ""
+            and len(seq) == expected_len
+            and str(data.get("genome_ver", "")) == str(genome_ver)
+            and str(data.get("chrom", "")) == str(_canonize_chromosome(chrom))
+            and int(data.get("start", 0)) == int(start)
+            and int(data.get("end", 0)) == int(end)
+            and int(data.get("strand", 0)) == _normalize_seq_strand(strand)
+        ):
+            log.debug(
+                f"Using cached Ensembl sequence for {chrom}:{start}-{end} strand={_normalize_seq_strand(strand)}"
+            )
             return seq
     except Exception:
         pass
@@ -1259,8 +1279,9 @@ def _write_cached_ensembl_sequence(chrom, start, end, strand, genome_ver, seq):
         "chrom": _canonize_chromosome(chrom),
         "start": int(start),
         "end": int(end),
-        "strand": 1 if str(strand) in ("1", "+", "plus") else -1,
+        "strand": _normalize_seq_strand(strand),
         "genome_ver": str(genome_ver),
+        "length": _expected_sequence_length(start, end),
         "seq": str(seq).upper(),
     }
     try:
@@ -1271,6 +1292,10 @@ def _write_cached_ensembl_sequence(chrom, start, end, strand, genome_ver, seq):
 
 
 def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=30, max_retries=5):
+    start = int(start)
+    end = int(end)
+    if end < start:
+        raise ValueError(f"Invalid sequence interval: {chrom}:{start}-{end}")
     cached_seq = _load_cached_ensembl_sequence(chrom, start, end, strand, genome_ver)
     if cached_seq is not None:
         return cached_seq
@@ -1292,6 +1317,12 @@ def fetch_sequence_from_ensembl(chrom, start, end, strand, genome_ver, timeout=3
                     f"Ensembl sequence response missing 'seq' for {chrom}:{start}-{end}"
                 )
             seq = data["seq"].upper()
+            expected_len = _expected_sequence_length(start, end)
+            if len(seq) != expected_len:
+                raise RuntimeError(
+                    f"Ensembl sequence length mismatch for {chrom}:{start}-{end}: "
+                    f"expected {expected_len}, got {len(seq)}"
+                )
             _write_cached_ensembl_sequence(chrom, start, end, strand, genome_ver, seq)
             return seq
         except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
@@ -1711,16 +1742,12 @@ def _run_chopchop_from_template(loc, dist, genome_ver, pam, chopchop_config):
         )
 
     chrom, pos, _strand = loc
-    flank = int(chopchop_config.get("window_padding", 80))
-    window_start = int(chopchop_config.get("window_start_override", max(1, int(pos) - int(dist) - flank)))
-    window_end = int(chopchop_config.get("window_end_override", int(pos) + int(dist) + flank))
-    target_seq = fetch_sequence_from_ensembl(
+    window_start, window_end, target_seq = _resolve_chopchop_window_and_sequence(
         chrom=chrom,
-        start=window_start,
-        end=window_end,
-        strand=1,
+        pos=pos,
+        dist=dist,
         genome_ver=genome_ver,
-        timeout=int(chopchop_config.get("ensembl_timeout", 30)),
+        chopchop_config=chopchop_config,
     )
     _dump_chopchop_debug(
         chopchop_config=chopchop_config,
@@ -1817,6 +1844,23 @@ def _default_chopchop_web_payload(target_seq, genome_ver, pam, chopchop_config, 
     }
 
 
+def _resolve_chopchop_window_and_sequence(chrom, pos, dist, genome_ver, chopchop_config, gene_input=""):
+    flank = int((chopchop_config or {}).get("window_padding", 80))
+    window_start = int((chopchop_config or {}).get("window_start_override", max(1, int(pos) - int(dist) - flank)))
+    window_end = int((chopchop_config or {}).get("window_end_override", int(pos) + int(dist) + flank))
+    target_seq = ""
+    if str(gene_input).strip() == "":
+        target_seq = fetch_sequence_from_ensembl(
+            chrom=chrom,
+            start=window_start,
+            end=window_end,
+            strand=1,
+            genome_ver=genome_ver,
+            timeout=int((chopchop_config or {}).get("ensembl_timeout", 30)),
+        )
+    return window_start, window_end, target_seq
+
+
 def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
     if chopchop_config is None:
         chopchop_config = {}
@@ -1826,19 +1870,14 @@ def _run_chopchop_web(loc, dist, genome_ver, pam, chopchop_config):
 
     chrom, pos, _strand = loc
     gene_input = str(chopchop_config.get("gene_input", "")).strip()
-    flank = int(chopchop_config.get("window_padding", 80))
-    window_start = int(chopchop_config.get("window_start_override", max(1, int(pos) - int(dist) - flank)))
-    window_end = int(chopchop_config.get("window_end_override", int(pos) + int(dist) + flank))
-    target_seq = ""
-    if gene_input == "":
-        target_seq = fetch_sequence_from_ensembl(
-            chrom=chrom,
-            start=window_start,
-            end=window_end,
-            strand=1,
-            genome_ver=genome_ver,
-            timeout=int(chopchop_config.get("ensembl_timeout", 30)),
-        )
+    window_start, window_end, target_seq = _resolve_chopchop_window_and_sequence(
+        chrom=chrom,
+        pos=pos,
+        dist=dist,
+        genome_ver=genome_ver,
+        chopchop_config=chopchop_config,
+        gene_input=gene_input,
+    )
 
     payload_json = chopchop_config.get("web_payload_json", "")
     if payload_json:
@@ -1958,19 +1997,14 @@ def get_chopchop_raw_results(loc, dist, genome_ver, pam, chopchop_config):
 
     chrom, pos, _strand = loc
     gene_input = str(chopchop_config.get("gene_input", "")).strip()
-    flank = int(chopchop_config.get("window_padding", 80))
-    window_start = max(1, int(pos) - int(dist) - flank)
-    window_end = int(pos) + int(dist) + flank
-    target_seq = ""
-    if gene_input == "":
-        target_seq = fetch_sequence_from_ensembl(
-            chrom=chrom,
-            start=window_start,
-            end=window_end,
-            strand=1,
-            genome_ver=genome_ver,
-            timeout=int(chopchop_config.get("ensembl_timeout", 30)),
-        )
+    window_start, window_end, target_seq = _resolve_chopchop_window_and_sequence(
+        chrom=chrom,
+        pos=pos,
+        dist=dist,
+        genome_ver=genome_ver,
+        chopchop_config=chopchop_config,
+        gene_input=gene_input,
+    )
 
     payload_json = chopchop_config.get("web_payload_json", "")
     if payload_json:
@@ -2242,9 +2276,6 @@ def get_seq(chr, start, end, strand, genome_ver):
     else:
         use_ensembl_fallback = os.environ.get("PROTOSPACEJAM_USE_ENSEMBL_SEQ", "1")
         if use_ensembl_fallback == "1":
-            # TODO: add a persistent region-level sequence cache under ensembl_cache_dir
-            # keyed by genome/chrom/start/end/strand. This should avoid repeated Ensembl REST
-            # calls for the same windows without requiring bulky whole-chromosome pickle files.
             log.warning(
                 f"Local genome pickle not found ({chr_file_path}); fetching region from Ensembl REST."
             )

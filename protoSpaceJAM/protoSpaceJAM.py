@@ -20,6 +20,7 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio.SeqFeature import SeqFeature, FeatureLocation
+from Bio.SeqFeature import CompoundLocation
 from Bio.GenBank import Record
 
 
@@ -1832,9 +1833,9 @@ def main(custom_args=None):
                         csvout_N.write(
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
-                            csvout_res.write(
-                                f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
-                            )
+                        csvout_res.write(
+                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
                             + f",{HDR_template.ENST_chr},{insert_pos},{ENST_ID},{name}\n"
@@ -1845,9 +1846,9 @@ def main(custom_args=None):
                         )
                         if not isinstance(cfd4, float):
                             cfd4 = ""
-                            csvout_res.write(
-                                f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
-                            )
+                        csvout_res.write(
+                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
                             + f",{HDR_template.ENST_chr},{insert_pos},{ENST_ID},{name}\n"
@@ -2080,9 +2081,9 @@ def main(custom_args=None):
                         csvout_C.write(
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
-                            csvout_res.write(
-                                f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
-                            )
+                        csvout_res.write(
+                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        )
                         csvout_res2.write( f"{Entry},"+
                             config["genome_ver"]
                             + f",{HDR_template.ENST_chr},{insert_pos},{ENST_ID},{name}\n"
@@ -2093,9 +2094,9 @@ def main(custom_args=None):
                         )
                         if not isinstance(cfd4, float):
                             cfd4 = ""
-                            csvout_res.write(
-                                f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
-                            )
+                        csvout_res.write(
+                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
                             + f",{HDR_template.ENST_chr},{insert_pos},{ENST_ID},{name}\n"
@@ -2230,7 +2231,7 @@ def _region_entry_to_genbank_type(region_entry):
     if label.startswith("exon"):
         return "exon"
     if region_type == "CDS":
-        return "CDS"
+        return "misc_feature"
     return "misc_feature"
 
 
@@ -2327,6 +2328,108 @@ def _project_transcript_regions_to_donor_features(data_obj, payloadless=False):
             )
     return features
 
+
+def _append_orf_cds_features(seq_record, sequence, feature_dict, label="CDS"):
+    if not isinstance(feature_dict, dict):
+        return
+    coding_coords = feature_dict.get("coding_coord")
+    donor_phases = feature_dict.get("donor_phases", "")
+    orf_coords = feature_dict.get("ORF_coord")
+    strand = int(feature_dict.get("HA_payload_strand", 1) or 1)
+    use_phase_aware_cds = (
+        isinstance(coding_coords, list)
+        and len(coding_coords) > 0
+        and isinstance(donor_phases, str)
+        and len(donor_phases) == len(sequence)
+    )
+
+    if use_phase_aware_cds:
+        valid_parts = []
+        part_seqs = []
+        part_phases = []
+        for feat in coding_coords:
+            if not _valid_coord_pair(feat):
+                continue
+            start = int(feat[0])
+            end = int(feat[1])
+            if start < 0 or end > len(sequence) or end <= start:
+                continue
+            valid_parts.append(FeatureLocation(start=start, end=end, strand=strand))
+            part_seqs.append(str(sequence[start:end]))
+            part_phases.append(donor_phases[start:end])
+
+        if len(valid_parts) == 0:
+            return
+
+        coding_seq = "".join(part_seqs)
+        coding_phase_seq = "".join(part_phases)
+        if strand < 0:
+            coding_seq = str(Seq(coding_seq).reverse_complement())
+            coding_phase_seq = coding_phase_seq[::-1]
+
+        first_phase = next((ch for ch in coding_phase_seq if ch in "123"), "")
+        if first_phase == "":
+            return
+
+        codon_start = {"1": 1, "2": 3, "3": 2}.get(first_phase, 1)
+        translate_start = codon_start - 1
+        translatable_seq = coding_seq[translate_start:]
+        usable_len = len(translatable_seq) - (len(translatable_seq) % 3)
+        if usable_len <= 0:
+            return
+        translatable_seq = translatable_seq[:usable_len]
+        protein_sequence = translate_sequence(translatable_seq)
+
+        location = (
+            valid_parts[0]
+            if len(valid_parts) == 1
+            else CompoundLocation(valid_parts, operator="join")
+        )
+        feature = SeqFeature(
+            location,
+            type="CDS",
+            qualifiers={
+                "label": label,
+                "codon_start": codon_start,
+                "translation": protein_sequence,
+            },
+        )
+        seq_record.features.append(feature)
+        return
+
+    if not isinstance(orf_coords, list) or len(orf_coords) == 0:
+        return
+
+    valid_parts = []
+    part_seqs = []
+    for feat in orf_coords:
+        if not _valid_coord_pair(feat):
+            continue
+        start = int(feat[0])
+        end = int(feat[1])
+        valid_parts.append(FeatureLocation(start=start, end=end, strand=strand))
+        part_seqs.append(str(sequence[start:end]))
+
+    if len(valid_parts) == 0:
+        return
+
+    coding_seq = "".join(part_seqs)
+    if strand < 0:
+        coding_seq = str(Seq(coding_seq).reverse_complement())
+    protein_sequence = translate_sequence(coding_seq)
+
+    location = (
+        valid_parts[0]
+        if len(valid_parts) == 1
+        else CompoundLocation(valid_parts, operator="join")
+    )
+    feature = SeqFeature(
+        location,
+        type="CDS",
+        qualifiers={"label": label, "codon_start": 1, "translation": protein_sequence},
+    )
+    seq_record.features.append(feature)
+
 def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
     """write genebank file"""
     donor_locus, donor_record_id = _genbank_record_names(donor_name)
@@ -2377,6 +2480,13 @@ def write_genbank(handle, data_obj, donor_name, donor_type, payload_type):
     )
     for region_feature in projected_region_features:
         seq_record.features.append(region_feature)
+
+    _append_orf_cds_features(
+        seq_record=seq_record,
+        sequence=sequence,
+        feature_dict=donor_features,
+        label="CDS",
+    )
 
     if _valid_coord_pair(donor_features.get("tag_coord")):
         tag_start, tag_end = donor_features["tag_coord"]
@@ -2460,18 +2570,12 @@ def write_genbank_gRNAonly_noPayload(handle, data_obj, donor_name, donor_type, p
     for region_feature in projected_region_features:
         seq_record.features.append(region_feature)
 
-    if "ORF_coord" in payloadless_features and "HA_payload_strand" in payloadless_features:
-        for feat in payloadless_features["ORF_coord"]:
-            if not _valid_coord_pair(feat):
-                continue
-            #feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=data_obj.Donor_features["HA_payload_strand"], type='CDS-in-frame', qualifiers={"label": "CDS-in-frame"})
-            #seq_record.features.append(feature)
-
-            # Extract and translate the coding in-frame sequence
-            orf_sequence = sequence[feat[0]:feat[1]]
-            protein_sequence = translate_sequence(str(orf_sequence))
-            protein_feature = SeqFeature(FeatureLocation(start=feat[0], end=feat[1]), strand=payloadless_features["HA_payload_strand"],type='CDS', qualifiers={"label": "CDS", "codon_start": 1, "translation": protein_sequence})
-            seq_record.features.append(protein_feature)
+    _append_orf_cds_features(
+        seq_record=seq_record,
+        sequence=sequence,
+        feature_dict=payloadless_features,
+        label="CDS",
+    )
 
     if "gRNA_coord" in payloadless_features and "gRNA_strand" in payloadless_features:
         for feat in payloadless_features["gRNA_coord"]:

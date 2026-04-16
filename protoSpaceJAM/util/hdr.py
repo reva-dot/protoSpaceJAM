@@ -1875,11 +1875,13 @@ class HDR_flank:
         """
         donor_phases = self.left_flk_phases + "X" * len(self.tag) + self.right_flk_phases # get the donor phases
         coding_coord = self.get_coding_coord_from_phases(donor_phases) # get coding coordinates
+        donor_phases_display = donor_phases
 
         # adjust the coding coordinates for SNP mode (6 of 6)
         if self.payload_type == "SNP":
             donor_phases = self.left_flk_phases + self.right_flk_phases_before_SNPadjustment
             coding_coord = self.get_coding_coord_from_phases(donor_phases) # get coding coordinates
+            donor_phases_display = donor_phases
 
         if self.Donor_type == "ssODN":
             #apply the centering logic to the coords
@@ -1893,12 +1895,14 @@ class HDR_flank:
                 center_start = int(self.centering_start)
                 center_end = int(self.centering_end)
             donor_phases_center = donor_phases[center_start:center_end] # get the ORF coordinates
+            donor_phases_display = donor_phases_center
             ORF_coord = self.get_coding_coord_from_phases(donor_phases_center, ORF=True)
             ORF_coord = [(i[0], i[1]+1) for i in ORF_coord] # end offset
 
             if self.strand_flipped: # flip the coordinates to matched the flipped strand
                 coding_coord = [[len(self.Donor_final)-i[1], len(self.Donor_final)-i[0]] for i in coding_coord]
                 ORF_coord = [[len(self.Donor_final)-i[1], len(self.Donor_final)-i[0]] for i in ORF_coord]
+                donor_phases_display = donor_phases_display[::-1]
 
         if self.Donor_type == "dsDNA": #TODO: add ORF coord to dsDNA mode
             # convert the coordinates to 1-indexed
@@ -1917,6 +1921,7 @@ class HDR_flank:
                 trimming_start = self.dsDNA_trimming_start
                 trimming_end = self.dsDNA_trimming_end
             donor_phases_trimmed = donor_phases[trimming_start:trimming_end]
+            donor_phases_display = donor_phases_trimmed
             ORF_coord = self.get_coding_coord_from_phases(donor_phases_trimmed, ORF=True)
             ORF_coord = [(i[0]+1, i[1]+2) for i in ORF_coord] # end offset
 
@@ -1924,12 +1929,14 @@ class HDR_flank:
         if not hasattr(self, "Donor_features"):
             self.Donor_features =  {    
                 "coding_coord": coding_coord,
-                "ORF_coord": ORF_coord
+                "ORF_coord": ORF_coord,
+                "donor_phases": donor_phases_display,
             }
         else:
             self.Donor_features.update({    
                 "coding_coord": coding_coord,
-                "ORF_coord": ORF_coord
+                "ORF_coord": ORF_coord,
+                "donor_phases": donor_phases_display,
             })
     
 
@@ -2017,6 +2024,7 @@ class HDR_flank:
     def compute_payloadless_donor_coding_coordinates(self):
         donor_phases = self.left_flk_phases_vanilla + self.right_flk_phases_vanilla # get the donor phases
         coding_coord = self.get_coding_coord_from_phases(donor_phases) # get coding coordinates
+        donor_phases_display = donor_phases
 
         if self.Donor_type == "ssODN":
             coding_coord = [i for i in coding_coord if i] # remove None values
@@ -2028,6 +2036,7 @@ class HDR_flank:
                 _len = len(donor_phases)
                 coding_coord = [[_len-i[1], _len-i[0]] for i in coding_coord]
                 ORF_coord = [[_len-i[1], _len-i[0]] for i in ORF_coord]
+                donor_phases_display = donor_phases[::-1]
 
         if self.Donor_type == "dsDNA": #TODO: add ORF coord to dsDNA mode
             # convert the coordinates to 1-indexed
@@ -2039,12 +2048,14 @@ class HDR_flank:
         if not hasattr(self, "payloadless_donor_features"):
             self.payloadless_donor_features =  {    
                 "coding_coord": coding_coord,
-                "ORF_coord": ORF_coord
+                "ORF_coord": ORF_coord,
+                "donor_phases": donor_phases_display,
             }
         else:
             self.payloadless_donor_features.update({    
                 "coding_coord": coding_coord,
-                "ORF_coord": ORF_coord
+                "ORF_coord": ORF_coord,
+                "donor_phases": donor_phases_display,
             })
     
     def compute_payloadless_donor_feature_coordinates(self):

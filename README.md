@@ -222,18 +222,24 @@ Each run writes a main output folder containing the design tables and per-design
 ### Main tables
 
 - `result.csv`
+  - lean user-facing summary table
   - one row per final donor design
-  - includes guide coordinates, cut/edit distance, recut CFD summaries, donor names, and final donor sequence
+  - includes guide coordinates, cut/edit distance, a combined `cut_annotation` label, final recut CFD, and donor sequences
+
+- `result_audit.csv`
+  - full audit/detail table for each final donor design
+  - includes region-resolution metadata, intermediate CFD columns, donor names, and strand/junction diagnostics
 
 - `guides_from_chopchop.csv`
   - guide candidates that survived filtering
   - includes:
     - `chopchop_rank`
+    - `guide_ordering_seq`
     - `cut_pos`
-    - `cut_region_class`
-    - `cut_region_label_detailed`
-    - `cut_region_exon`
-    - `cut_position_types`
+    - `cut_region`
+    - `cut_region_detailed`
+    - `cut_exon_number`
+    - `cut_intron_number`
     - `target_region_label`
     - `target_region_start`
     - `target_region_end`
@@ -300,13 +306,17 @@ This scans the supplied sequence on both strands and reports the highest-scoring
 ## Useful CLI Options
 
 - `--HA_len <int>`: dsDNA homology-arm length on each side before any trimming. Default: `500`
+- `--left_HA_len <int>`: optional dsDNA left-arm override when you want asymmetric homology arms
+- `--right_HA_len <int>`: optional dsDNA right-arm override when you want asymmetric homology arms
 - `--MinArmLenPostTrim <int>`: minimum dsDNA arm length to preserve after synthesis-motivated trimming. `0` disables trimming. Default: `0`
 - `--ssODN_max_size <int>`: total ssODN length limit used when centering payload plus recoded sequence. Default: `200`
 - `--chopchop_target_type CODING|WHOLE`: CHOPCHOP sequence-window target mode. `WHOLE` is useful when you want intronic or UTR guides in the fetched genomic window rather than coding-only guides
+- `--chopchop_window_padding <int>`: extra genomic padding added on each side of the resolved target window before submitting sequence to CHOPCHOP
 - `--guides_only`: guide-discovery/debug mode that skips donor design and writes only the guide tables
 - `--specificity_backend default|chopchop_proxy|crispor`: choose how CHOPCHOP-derived guides are post-scored
 - `--crispor_cmd_template <string>`: required when `--specificity_backend crispor` is used
 - `--chopchop_debug_dump`: save the exact CHOPCHOP request payload and fetched sequence window for debugging
+- `--clean_genbank_dir`: clear `<outdir>/genbank_files` before writing new GenBank outputs
 
 ## Advanced / Legacy Local Workflows
 
@@ -322,10 +332,11 @@ For most new users, you can ignore that directory.
 ### My guides are not in the region I expected
 Check:
 - `guides_from_chopchop.csv`
-- `cut_region_class`
-- `cut_region_label_detailed`
-- `cut_region_exon`
-- `cut_position_types`
+- `result.csv` (`cut_annotation`)
+- `cut_region`
+- `cut_region_detailed`
+- `cut_exon_number`
+- `cut_intron_number`
 - `target_region_label`
 - `target_region_start`
 - `target_region_end`
@@ -337,6 +348,7 @@ Check:
 Interpretation:
 - `resolved_*` columns describe the requested anchor that protoSpaceJAM resolved from your CSV row
 - `cut_region_*` columns describe where each guide actually cuts
+- `guide_ordering_seq` gives the RNA-style guide sequence (`U` instead of `T`) for ordering/copying
 - these are not always identical, because the tool currently resolves an insertion coordinate first and then finds nearby guides by cut distance
 
 ### I want intronic guides near a CDS anchor
@@ -372,7 +384,11 @@ Do not rely on `Target_terminus=N/C` to steer a preferred-region request.
 Use a persistent cache directory:
 - `--ensembl_cache_dir output/ensembl_cache`
 
-That lets future runs reuse transcript annotation without re-fetching it.
+That lets future runs reuse:
+
+- transcript annotation bundles
+- normalized region catalogs
+- fetched Ensembl sequence windows used for homology arms and CHOPCHOP sequence-mode runs
 
 ## License
 

@@ -1,4 +1,5 @@
 import datetime
+import csv
 import io
 import linecache
 import logging
@@ -1115,10 +1116,12 @@ def main(custom_args=None):
         )
 
         # open result file and write header
-        csvout_res = open(f"{outdir}/result.csv", "w")
-        csvout_res.write(
-            f"Entry,ID,chr,transcript_type,name,terminus,design_rank,gRNA_name,gRNA_seq,guide_ordering_seq,PAM,gRNA_start,gRNA_end,gRNA_cut_pos,cut_region,cut_region_detailed,cut_exon_number,cut_intron_number,edit_pos,distance_between_cut_and_edit(cut_pos-insert_pos),chopchop_rank,target_region_label,target_region_start,target_region_end,resolved_region_label,resolved_region_start,resolved_region_end,resolved_anchor,resolved_offset,resolved_coordinate,cfd_before_recoding,cfd_after_recoding,cfd_after_windowScan_and_recoding,max_recut_cfd,name_of_DNA_donor,DNA donor,name_of_trimmed_DNA_Donor,trimmed_DNA_donor,effective_HA_len,synthesis_problems,cutPos2nearestOffLimitJunc,strand(gene/gRNA/donor)\n"
-        )   #"Entry,ID,chr,transcript_type,name,terminus,gRNA_seq,PAM,gRNA_start,gRNA_end,gRNA_cut_pos,edit_pos,distance_between_cut_and_edit(cut pos - insert pos),specificity_score,specificity_weight,distance_weight,position_weight,final_weight,cfd_before_recoding,cfd_after_recoding,cfd_after_windowScan_and_recoding,max_recut_cfd,DNA donor,effective_HA_len,synthesis_problems,cutPos2nearestOffLimitJunc,strand(gene/gRNA/donor)\n"
+        csvout_res = open(f"{outdir}/result.csv", "w", newline="")
+        result_writer = csv.DictWriter(csvout_res, fieldnames=RESULT_MAIN_COLUMNS)
+        result_writer.writeheader()
+        csvout_res_audit = open(f"{outdir}/result_audit.csv", "w", newline="")
+        result_audit_writer = csv.DictWriter(csvout_res_audit, fieldnames=RESULT_AUDIT_COLUMNS)
+        result_audit_writer.writeheader()
 
         # Legacy GenoPrimer export is kept in-memory for now.
         csvout_res2 = io.StringIO()
@@ -1332,9 +1335,15 @@ def main(custom_args=None):
                 name = ENST_info[ENST_ID].name
             else:
                 name = ""
-            row_prefix = f"{ENST_ID},{ENST_info[ENST_ID].chr},{transcript_type},{name}"
+            result_id = ENST_ID
+            result_chr = ENST_info[ENST_ID].chr
+            result_transcript_type = transcript_type
+            result_name = name
             if coordinate_without_ENST:
-                row_prefix = f",,,"
+                result_id = ""
+                result_chr = ""
+                result_transcript_type = ""
+                result_name = ""
 
             # get codon_phase information for current ENST
             ENST_PhaseInCodon = {}
@@ -1576,8 +1585,21 @@ def main(custom_args=None):
                         cut_region_intron = current_gRNA["cut_region_intron"].values[0] if "cut_region_intron" in current_gRNA.columns else ""
                         insert_pos = HDR_template.InsPos
                         if config["recoding_off"]:
-                            csvout_res.write(
-                                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            write_result_rows(
+                                result_writer,
+                                result_audit_writer,
+                                build_result_row(
+                                    Entry, result_id, result_chr, result_transcript_type, result_name, "-", i + 1,
+                                    gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                    cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                    cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                    target_region_end, resolved_region_label, resolved_region_start,
+                                    resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                    ret_six_dec(pre_recoding_cfd_score), "recoding turned off", "",
+                                    ret_six_dec(cfdfinal), donor_name, donor, donor_trimmed_name,
+                                    donor_trimmed, HDR_template.effective_HA_len, HDR_template.synFlags,
+                                    HDR_template.cutPos2nearestOffLimitJunc, strands,
+                                ),
                             )
                             csvout_res2.write( f"{Entry},"+
                                 config["genome_ver"]
@@ -1586,8 +1608,21 @@ def main(custom_args=None):
                         else:
                             if not isinstance(cfd4, float):
                                 cfd4 = ""
-                            csvout_res.write(
-                f"{Entry},{row_prefix},-,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                            write_result_rows(
+                                result_writer,
+                                result_audit_writer,
+                                build_result_row(
+                                    Entry, result_id, result_chr, result_transcript_type, result_name, "-", i + 1,
+                                    gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                    cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                    cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                    target_region_end, resolved_region_label, resolved_region_start,
+                                    resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                    ret_six_dec(pre_recoding_cfd_score), ret_six_dec(cfd4),
+                                    ret_six_dec(cfd_scan), ret_six_dec(cfdfinal), donor_name, donor,
+                                    donor_trimmed_name, donor_trimmed, HDR_template.effective_HA_len,
+                                    HDR_template.synFlags, HDR_template.cutPos2nearestOffLimitJunc, strands,
+                                ),
                             )
                             csvout_res2.write( f"{Entry},"+
                                 config["genome_ver"]
@@ -1833,8 +1868,21 @@ def main(custom_args=None):
                         csvout_N.write(
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
-                        csvout_res.write(
-                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        write_result_rows(
+                            result_writer,
+                            result_audit_writer,
+                            build_result_row(
+                                Entry, result_id, result_chr, result_transcript_type, result_name, "N", i + 1,
+                                gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                target_region_end, resolved_region_label, resolved_region_start,
+                                resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                ret_six_dec(pre_recoding_cfd_score), "recoding turned off", "",
+                                ret_six_dec(cfdfinal), donor_name, donor, donor_trimmed_name,
+                                donor_trimmed, HDR_template.effective_HA_len, HDR_template.synFlags,
+                                HDR_template.cutPos2nearestOffLimitJunc, strands,
+                            ),
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -1846,8 +1894,21 @@ def main(custom_args=None):
                         )
                         if not isinstance(cfd4, float):
                             cfd4 = ""
-                        csvout_res.write(
-                            f"{Entry},{row_prefix},N,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        write_result_rows(
+                            result_writer,
+                            result_audit_writer,
+                            build_result_row(
+                                Entry, result_id, result_chr, result_transcript_type, result_name, "N", i + 1,
+                                gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                target_region_end, resolved_region_label, resolved_region_start,
+                                resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                ret_six_dec(pre_recoding_cfd_score), ret_six_dec(cfd4),
+                                ret_six_dec(cfd_scan), ret_six_dec(cfdfinal), donor_name, donor,
+                                donor_trimmed_name, donor_trimmed, HDR_template.effective_HA_len,
+                                HDR_template.synFlags, HDR_template.cutPos2nearestOffLimitJunc, strands,
+                            ),
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -2081,8 +2142,21 @@ def main(custom_args=None):
                         csvout_C.write(
                             f",{cfd1},{cfd2},{cfd3},{cfd4},{cfd_scan},{cfd_scan_no_recode},{cfdfinal}\n"
                         )
-                        csvout_res.write(
-                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},recoding turned off,,{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        write_result_rows(
+                            result_writer,
+                            result_audit_writer,
+                            build_result_row(
+                                Entry, result_id, result_chr, result_transcript_type, result_name, "C", i + 1,
+                                gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                target_region_end, resolved_region_label, resolved_region_start,
+                                resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                ret_six_dec(pre_recoding_cfd_score), "recoding turned off", "",
+                                ret_six_dec(cfdfinal), donor_name, donor, donor_trimmed_name,
+                                donor_trimmed, HDR_template.effective_HA_len, HDR_template.synFlags,
+                                HDR_template.cutPos2nearestOffLimitJunc, strands,
+                            ),
                         )
                         csvout_res2.write( f"{Entry},"+
                             config["genome_ver"]
@@ -2094,8 +2168,21 @@ def main(custom_args=None):
                         )
                         if not isinstance(cfd4, float):
                             cfd4 = ""
-                        csvout_res.write(
-                            f"{Entry},{row_prefix},C,{i+1},{gRNA_name},{seq},{guide_seq_for_ordering(seq)},{pam},{s},{e},{gRNA_cut_pos},{cut_region_class},{cut_region_label_detailed},{cut_region_exon},{cut_region_intron},{insert_pos},{cut2ins_dist},{chopchop_rank},{target_region_label},{target_region_start},{target_region_end},{resolved_region_label},{resolved_region_start},{resolved_region_end},{resolved_anchor},{resolved_offset},{resolved_coordinate},{ret_six_dec(pre_recoding_cfd_score)},{ret_six_dec(cfd4)},{ret_six_dec(cfd_scan)},{ret_six_dec(cfdfinal)},{donor_name},{donor},{donor_trimmed_name},{donor_trimmed},{HDR_template.effective_HA_len},{HDR_template.synFlags},{HDR_template.cutPos2nearestOffLimitJunc},{strands}\n"
+                        write_result_rows(
+                            result_writer,
+                            result_audit_writer,
+                            build_result_row(
+                                Entry, result_id, result_chr, result_transcript_type, result_name, "C", i + 1,
+                                gRNA_name, seq, pam, s, e, gRNA_cut_pos, cut_region_class,
+                                cut_region_label_detailed, cut_region_exon, cut_region_intron, insert_pos,
+                                cut2ins_dist, chopchop_rank, target_region_label, target_region_start,
+                                target_region_end, resolved_region_label, resolved_region_start,
+                                resolved_region_end, resolved_anchor, resolved_offset, resolved_coordinate,
+                                ret_six_dec(pre_recoding_cfd_score), ret_six_dec(cfd4),
+                                ret_six_dec(cfd_scan), ret_six_dec(cfdfinal), donor_name, donor,
+                                donor_trimmed_name, donor_trimmed, HDR_template.effective_HA_len,
+                                HDR_template.synFlags, HDR_template.cutPos2nearestOffLimitJunc, strands,
+                            ),
                         )
                         csvout_res2.write(f"{Entry},"+
                             config["genome_ver"]
@@ -2168,6 +2255,7 @@ def main(custom_args=None):
         csvout_C.close()
         fiveUTR_log.close()
         csvout_res.close()
+        csvout_res_audit.close()
         csvout_res2.close()
         guides_out.close()
         ha_out.close()
@@ -2188,6 +2276,195 @@ def translate_sequence(dna_sequence):
 def guide_seq_for_ordering(seq):
     seq = str(seq or "")
     return seq.upper().replace("T", "U")
+
+
+RESULT_AUDIT_COLUMNS = [
+    "Entry",
+    "ID",
+    "chr",
+    "transcript_type",
+    "name",
+    "terminus",
+    "design_rank",
+    "gRNA_name",
+    "gRNA_seq",
+    "guide_ordering_seq",
+    "PAM",
+    "gRNA_start",
+    "gRNA_end",
+    "gRNA_cut_pos",
+    "cut_region",
+    "cut_region_detailed",
+    "cut_exon_number",
+    "cut_intron_number",
+    "edit_pos",
+    "distance_between_cut_and_edit(cut_pos-insert_pos)",
+    "chopchop_rank",
+    "target_region_label",
+    "target_region_start",
+    "target_region_end",
+    "resolved_region_label",
+    "resolved_region_start",
+    "resolved_region_end",
+    "resolved_anchor",
+    "resolved_offset",
+    "resolved_coordinate",
+    "cfd_before_recoding",
+    "cfd_after_recoding",
+    "cfd_after_windowScan_and_recoding",
+    "max_recut_cfd",
+    "name_of_DNA_donor",
+    "DNA donor",
+    "name_of_trimmed_DNA_Donor",
+    "trimmed_DNA_donor",
+    "effective_HA_len",
+    "synthesis_problems",
+    "cutPos2nearestOffLimitJunc",
+    "strand(gene/gRNA/donor)",
+]
+
+
+RESULT_MAIN_COLUMNS = [
+    "Entry",
+    "ID",
+    "chr",
+    "name",
+    "terminus",
+    "design_rank",
+    "gRNA_seq",
+    "guide_ordering_seq",
+    "PAM",
+    "gRNA_start",
+    "gRNA_end",
+    "gRNA_cut_pos",
+    "cut_annotation",
+    "edit_pos",
+    "distance_between_cut_and_edit(cut_pos-insert_pos)",
+    "chopchop_rank",
+    "max_recut_cfd",
+    "DNA donor",
+    "trimmed_DNA_donor",
+    "effective_HA_len",
+    "synthesis_problems",
+]
+
+
+def format_cut_annotation(cut_region, cut_region_detailed, cut_exon_number, cut_intron_number):
+    cut_region = str(cut_region or "").strip()
+    cut_region_detailed = str(cut_region_detailed or "").strip()
+    cut_exon_number = str(cut_exon_number or "").strip()
+    cut_intron_number = str(cut_intron_number or "").strip()
+
+    if cut_region_detailed:
+        return cut_region_detailed
+    if cut_region.lower() == "intron" and cut_intron_number:
+        return f"intron{cut_intron_number}"
+    if cut_exon_number and cut_region:
+        return f"{cut_region}_exon{cut_exon_number}"
+    if cut_intron_number and cut_region:
+        return f"{cut_region}_intron{cut_intron_number}"
+    if cut_exon_number:
+        return f"exon{cut_exon_number}"
+    if cut_intron_number:
+        return f"intron{cut_intron_number}"
+    return cut_region
+
+
+def build_result_row(
+    entry,
+    enst_id,
+    chrom,
+    transcript_type,
+    name,
+    terminus,
+    design_rank,
+    gRNA_name,
+    gRNA_seq,
+    pam,
+    gRNA_start,
+    gRNA_end,
+    gRNA_cut_pos,
+    cut_region,
+    cut_region_detailed,
+    cut_exon_number,
+    cut_intron_number,
+    edit_pos,
+    cut_to_insert_distance,
+    chopchop_rank,
+    target_region_label,
+    target_region_start,
+    target_region_end,
+    resolved_region_label,
+    resolved_region_start,
+    resolved_region_end,
+    resolved_anchor,
+    resolved_offset,
+    resolved_coordinate,
+    cfd_before_recoding,
+    cfd_after_recoding,
+    cfd_after_window_scan,
+    max_recut_cfd,
+    donor_name,
+    donor_seq,
+    donor_trimmed_name,
+    donor_trimmed_seq,
+    effective_ha_len,
+    synthesis_problems,
+    cut_pos_to_nearest_offlimit_junction,
+    strands,
+):
+    return {
+        "Entry": entry,
+        "ID": enst_id,
+        "chr": chrom,
+        "transcript_type": transcript_type,
+        "name": name,
+        "terminus": terminus,
+        "design_rank": design_rank,
+        "gRNA_name": gRNA_name,
+        "gRNA_seq": gRNA_seq,
+        "guide_ordering_seq": guide_seq_for_ordering(gRNA_seq),
+        "PAM": pam,
+        "gRNA_start": gRNA_start,
+        "gRNA_end": gRNA_end,
+        "gRNA_cut_pos": gRNA_cut_pos,
+        "cut_annotation": format_cut_annotation(
+            cut_region, cut_region_detailed, cut_exon_number, cut_intron_number
+        ),
+        "cut_region": cut_region,
+        "cut_region_detailed": cut_region_detailed,
+        "cut_exon_number": cut_exon_number,
+        "cut_intron_number": cut_intron_number,
+        "edit_pos": edit_pos,
+        "distance_between_cut_and_edit(cut_pos-insert_pos)": cut_to_insert_distance,
+        "chopchop_rank": chopchop_rank,
+        "target_region_label": target_region_label,
+        "target_region_start": target_region_start,
+        "target_region_end": target_region_end,
+        "resolved_region_label": resolved_region_label,
+        "resolved_region_start": resolved_region_start,
+        "resolved_region_end": resolved_region_end,
+        "resolved_anchor": resolved_anchor,
+        "resolved_offset": resolved_offset,
+        "resolved_coordinate": resolved_coordinate,
+        "cfd_before_recoding": cfd_before_recoding,
+        "cfd_after_recoding": cfd_after_recoding,
+        "cfd_after_windowScan_and_recoding": cfd_after_window_scan,
+        "max_recut_cfd": max_recut_cfd,
+        "name_of_DNA_donor": donor_name,
+        "DNA donor": donor_seq,
+        "name_of_trimmed_DNA_Donor": donor_trimmed_name,
+        "trimmed_DNA_donor": donor_trimmed_seq,
+        "effective_HA_len": effective_ha_len,
+        "synthesis_problems": synthesis_problems,
+        "cutPos2nearestOffLimitJunc": cut_pos_to_nearest_offlimit_junction,
+        "strand(gene/gRNA/donor)": strands,
+    }
+
+
+def write_result_rows(result_writer, audit_writer, row):
+    result_writer.writerow({col: row.get(col, "") for col in RESULT_MAIN_COLUMNS})
+    audit_writer.writerow({col: row.get(col, "") for col in RESULT_AUDIT_COLUMNS})
 
 
 def _valid_coord_pair(v):
